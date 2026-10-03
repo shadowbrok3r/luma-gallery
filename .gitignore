@@ -1,0 +1,12 @@
+/target
+/.build
+/native/vendor
+/native/libs
+/java/com/github/egui_mobile
+/evidence
+/assets/source
+# Personal camera samples are local test inputs, never application sources.
+/*.dng
+/*.DNG
+/*.arw
+/*.ARW
