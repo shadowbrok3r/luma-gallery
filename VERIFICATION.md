@@ -1,5 +1,263 @@
 # Verification
 
+## Video Frames Release 0.1.11 (2026-10-07)
+
+The old scrub worker invalidated every decode whenever another time request arrived,
+including repeated requests for the same time. Slow decodes could therefore never
+appear, and the popup retained the previous video's bitmap. Preview jobs now carry
+an immutable media/session identity, coalesce pending times, display completed progress
+with its own timestamp, and clear on release, media changes and backgrounding.
+
+On Android 16, WebM's `OPTION_CLOSEST` returned an earlier keyframe: a request around
+6.780 seconds showed 4.267 seconds. WebM/Matroska previews and full-resolution stills
+now decode forward with FFmpeg. Older cached thumbnails are invalidated.
+
+The camera icon beside video crop saves a PNG from the original video to Pictures/Luma,
+with rotation applied and no UI or pending crop. Capture pauses playback, honors pending
+frame steps, and leaves the source unchanged. Passive save notices allow taps through;
+notices containing Undo remain interactive. FFprobe JSON is written separately from
+diagnostics. Android metadata provides a fallback, and optional metadata failures no
+longer produce playback error notices or arrive from an already-closed video.
+
+All 30 host tests and 14 video-frame checks pass on the existing `s26ultra` AVD
+(`emulator-5554`, Android 16, x86_64, 1440 x 3120, density 560). The device checks cover
+moving/continuous previews, 20x precision labels, warm switches from H.264 to silent VP9 WebM, full-resolution
+960 x 540 PNGs, single-frame stepping, capture while playing and at the end, portrait
+rotation to 540 x 960, unchanged originals, and Android metadata fallback on playable
+silent MPEG-TS that the bundled FFprobe does not demux. Saved frames are compared to
+independent host decodes, allowing neighboring presentation frames for millisecond rounding.
+The user file that originally produced the probe error was not available; the fallback
+was exercised with a synthetic file instead. Physical S26/OEM/HDR behavior is not certified.
+
+The release APK's final build (preview-request dedupe, pre-Android 11 capture call) passed
+the same 14 checks again, plus the C0038 export regression: the fast cut starts at the
+original 3.570 s keyframe with 124 byte-identical packets, and the exact cut keeps 4K/AAC.
+The export script now reads the selected bounds from the framed In/Out fields.
+
+Evidence: `evidence/video-frames-0.1.11/final/` and `export-final/`; package/store
+verification: `evidence/release-0.1.11/`.
+
+```sh
+cargo test --lib
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-video-frames.py --serial emulator-5554 --evidence evidence/video-frames-0.1.11/final
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-export.py --serial emulator-5554 --original ~/Videos/Jewelry/C0038.MP4 --device-uri file:///sdcard/DCIM/Luma-Export/C0038.MP4
+```
+
+## Keyboard Focus Release 0.1.10 (2026-10-05)
+
+Two independent focus-loss paths were reproduced:
+
+- The Qwen prompt used a parent-derived widget ID. A tall keyboard could change
+  the editor from stacked to columns, replacing the focused widget and closing the
+  keyboard. The prompt now has an explicit per-session ID. Columns also require at
+  least 600 points of width so a short portrait viewport keeps full-width controls.
+- EguiMobile immediately interpreted a hidden IME inset as external dismissal.
+  During rotation, Android reattached its input connection and requested a show;
+  the bridge's immediate hide cancelled that show. The shared Java bridge now checks
+  the settled root insets after 300 ms. A visible inset, a new show, an explicit hide,
+  or Activity destruction cancels the pending check. Back still dismisses editing.
+
+The real-widget host regression failed before the ID fix and passes afterward,
+including typed input through keyboard resize and layout-parent changes. All 30
+library tests and five toolbar host tests pass. On the existing `s26ultra` AVD
+(`emulator-5554`, Android 16, Gboard), the 0.1.9 APK immediately closed the keyboard
+in a 1440 x 2200 viewport. The fixed build passes seven focus checks in that viewport
+and the original 1440 x 3120 viewport: opening/typing, three Back/reopen cycles at
+each size, typing through both rotations without retapping, and final dismissal.
+The seven existing clipboard/caret/Enter checks also pass. Display overrides and
+rotation settings are restored by the regression script.
+The separately rebuilt EguiMobile Android Hello demo passes four checks of the
+shared bridge: multiline typing, uninterrupted typing through each rotation, and Back.
+
+The Java fix is identical in Luma's vendored backend and the shared EguiMobile
+checkout. Other apps need rebuilding to receive it. Samsung Keyboard was reported
+by the user but is unavailable on this AVD; these results do not certify its OEM
+behavior. Evidence: `evidence/keyboard-focus-0.1.10/`; release package and store
+verification: `evidence/release-0.1.10/`.
+
+```sh
+cargo test --lib
+cargo test --manifest-path scripts/text-actions-tests/Cargo.toml --target-dir target
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-keyboard-focus.py --serial emulator-5554
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-text-menu.py --serial emulator-5554
+```
+
+## Text Toolbar Release 0.1.9 (2026-10-05)
+
+EguiMobile's Paste/Copy/Cut/Select-all toolbar previously occupied app layout space,
+covering long or bottom-aligned text fields. The Android adapter now reserves a
+measured strip before app layout, above the actual keyboard inset. The toolbar is
+clipped to that strip, reflows with window/style changes, and returns the space when
+dismissed. No guessed keyboard fraction or per-app vertical anchor is needed.
+The same implementation is in the shared EguiMobile checkout and Luma's vendored
+backend. The shared checkout also includes the earlier subclass-IME and Enter fixes.
+
+Luma's editor permits smaller scroll viewports in landscape. Its Qwen prompt also
+follows the caret after text reflow: pasting into an empty field can change egui's
+rendered text height one frame after the text-change event. Ordinary scrolling
+remains free because caret following only runs when text/viewport geometry changes.
+
+- 29 Luma library tests and five host tests of the actual toolbar widget pass.
+  Host coverage includes portrait, landscape, hardware keyboards, changing keyboard
+  height, large controls, narrow-to-wide reflow, anchors, dismissal and button taps.
+- ARTEMIS/ADB reproduced the overlap on the existing `s26ultra` AVD, Android 16,
+  x86_64, 1440 x 3120. `scripts/smoke-text-menu.py` passes seven checks: ten-line
+  prompt bounds, Select all/Copy/Paste, Cut/Paste into empty text, 25-line caret
+  scrolling, Back dismissal, landscape caret visibility and single-line Enter.
+  OCR and detected field/menu outlines verify that the text stays above the menu.
+- The shared EguiMobile Android Hello demo exposes a **Text actions** screen for
+  direct checks independent of Luma's layout. Five device checks passed there too:
+  multiline caret visibility, Select all/Copy/Paste, Cut/Paste, landscape typing
+  and single-line Enter dismissal.
+
+Evidence: `evidence/text-menu-0.1.9/`; packaging, signing and store verification:
+`evidence/release-0.1.9/`. Other apps need rebuilding against the shared changes.
+
+```sh
+cargo test --lib
+cargo test --manifest-path scripts/text-actions-tests/Cargo.toml --target-dir target
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-text-menu.py --serial emulator-5554
+```
+
+## Sharing Release 0.1.8 (2026-10-05)
+
+Android advertises Luma for `VIEW`, `SEND` and `SEND_MULTIPLE` with `image/*` and
+`video/*`. Both cold launches and `onNewIntent` resolve content URIs off the UI
+thread, using the sender's read grant. Shared items have their own ordered viewer
+collection; library scans and filters do not remove them. A new share asks before
+closing the photo editor or a video trim/crop. Unsupported attachments are skipped,
+unreadable shares keep the current view, and a slow earlier provider cannot replace
+a newer share. The 0.1.7 keyboard backend is unchanged.
+
+- All 29 library tests pass, including shared navigation outside library filters,
+  keeping an open photo editor, and preserving a pending video trim.
+- ARTEMIS screenshots/hierarchy and ADB established the real Android chooser,
+  share sheet, mixed-media navigation and editor paths on the existing `s26ultra`
+  AVD (`emulator-5554`, Android 16 / x86_64).
+- `scripts/smoke-share.py`: 11 passing checks using a separate test app's unexported
+  provider. Luma's three media-read permissions were disabled during the checks and
+  restored afterward. Cold Open with, warm video sharing in the same Activity process,
+  audio waveform generation, mixed multi-share ordering, ClipData-only streams and
+  names without extensions all pass. Shell access to the provider is denied.
+- A shared 900 x 600 photo crops to a pixel-exact 600 x 600 PNG copy. Receiving another
+  share and choosing Keep editing preserves that crop; Open media accepts the next
+  share. Invalid attachments, missing files and a deliberately slow provider also pass.
+
+Evidence: `evidence/share-0.1.8/`; release package and store checks:
+`evidence/release-0.1.8/`. The sender under `scripts/share-probe/` is test tooling,
+not part of Luma's application classes.
+
+```sh
+cargo test --lib
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-share.py --serial emulator-5554
+```
+
+## Keyboard Release 0.1.7 (2026-10-05)
+
+The Android backend recognizes subclasses of `EguiNativeActivity`, enabling its IME
+bridge in Luma's `GalleryActivity`. Enter in a single-line field also tears down the
+keyboard session instead of restoring focus. The implemented backend sources from
+EguiMobile revision `ad77e546` are retained unchanged in `vendor/egui-android`; its
+manifest pins shared dependencies to the public `31d1cbeb` base. Builds no longer
+depend on the implementation agent's temporary checkout.
+
+- All 26 library tests pass.
+- On the existing `s26ultra` AVD, the Qwen prompt opens the soft keyboard, accepts text,
+  dismisses on Back, reopens on a second tap, and accepts deletion back to an empty prompt.
+- Pen-only rejection, stylus painting, mask retention across tabs and Undo still pass.
+- Entered 2 and 6 seconds in the video trim fields using the soft-keyboard editing
+  session; Enter dismisses the keyboard. The exported square clip is 360 x 360,
+  approximately four seconds long, with its first frame and audio pulses matching
+  the selected source interval.
+
+Five targeted device checks passed using `keyboard_check`, `mask_checks` and
+`clip_check` from `scripts/smoke-editing.py`. Evidence: `evidence/keyboard-0.1.7/`;
+release package and store checks: `evidence/release-0.1.7/`.
+
+## Crop Release 0.1.6 (2026-10-05)
+
+Photo/video crop gestures now retain their starting pointer position through release.
+Previously, egui cleared `press_origin()` on release while still supplying the final
+pointer position; the crop handler then used zero displacement and restored the original
+rectangle. The shared handler now stores the origin with the starting crop.
+
+- Both new egui gesture regressions failed before the fix and pass afterward. All 26
+  library tests pass. Coverage includes all four corners, square-crop movement, clamping
+  at the image boundary, release and idle frames, with both touch and mouse events.
+- ARTEMIS screenshots/hierarchy and ADB established the paths on the existing `s26ultra`
+  AVD (`emulator-5554`, Android 16 / x86_64, 1440 x 3120). The old photo and video selection
+  visibly moved during contact and returned to its starting bounds on release.
+- `scripts/smoke-crop.py`: 15 passing checks. Moved and resized bounds persist after touch
+  release in photos, landscape MP4 and rotated MOV. A square moved against the photo's
+  left edge exports a pixel-exact 600 x 600 source crop; shrinking it exports a pixel-exact
+  302 x 301 crop. Switching photo-editor tabs retains the rectangle.
+- Both 2–6 second video exports retain the smaller, moved crop: output frames match an
+  independent decode/crop of the original, including display rotation. Audio remains
+  present, duration stays within 160 ms of four seconds, and all seven original fixture
+  hashes remain unchanged.
+
+Evidence: `evidence/crop-fix-0.1.6/`; release package/store checks: `evidence/release-0.1.6/`.
+
+```sh
+cargo test --lib
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-crop.py --serial emulator-5554
+```
+
+## Editing Release 0.1.5 (2026-10-05)
+
+The editing checks below ran on the development 0.1.4 build. Release 0.1.5 changes
+only the package version and this verification record from that tested build;
+the higher version code allows updates from the published 0.1.4 library release.
+
+Used the existing `s26ultra` AVD, `emulator-5554`, Android 16 / x86_64, 1440 x 3120 at
+density 560. ARTEMIS screenshots/hierarchy and ADB established the interaction paths;
+`scripts/smoke-editing.py` uses OCR with verified icon-coordinate fallbacks and bounded
+waits for rendered media, server results and completed exports. Originals are synthetic.
+
+- `cargo test --lib`: 24 passing tests, including crop rounding after serialization,
+  rotation/mirroring, transient-preserving waveform pooling, alpha-mask RGB preservation,
+  circular brush geometry, pressure/undo and palm/pen input gates.
+- Photo exports: a 900 x 600 PNG crops to exactly 600 x 600 with identical source pixels.
+  Rotate/mirror output is pixel-exact; setting Color to zero produces a grayscale copy.
+  The photo editor also renders correctly in landscape. WebP and GIF first-frame PNG copies match decoded
+  sources; EXIF orientation 6 exports a correctly oriented 600 x 900 JPEG-derived copy.
+- S Pen event simulation: pen-only rejects finger strokes; stylus strokes paint; undo
+  restores the canvas; switching tabs retains the mask. A 600 ms stationary contact at
+  pressure 0.2 affects 1,053 pixels, versus 4,560 at pressure 1.0. Eraser-tip and barrel-button
+  contacts erase, including release; undo restores the erased region. The runnable
+  `scripts/StylusStroke.java` probe is compiled only for testing, outside the app.
+- Live Qwen: authenticated against `https://comfy.shadowbroker.app`, uploaded a synthetic
+  painted PNG, ran 25 steps, stopped waiting locally and resumed the same server job,
+  downloaded/reviewed/saved a 900 x 600 result, then resumed it after process restart.
+  One measured result changed only bounds `(606,113)..(891,477)`;
+  every pixel outside that region was identical to the upload. The correct gateway is
+  configured on the emulator; credentials are private app data and absent from the APK.
+- Video: the 2.000–6.000 s square crop exports H.264 360 x 360 with AAC, container duration
+  4.021333 s. Decoded pulse peaks occur at 0.02–0.12 s and 2.02–2.12 s, matching the source
+  beats plus AAC padding. The waveform displays these transients under the same time axis
+  as video. Silent VP9 WebM reports no audio. Rotation fixtures use a verified display
+  matrix; `-metadata rotate=90` on the host's FFmpeg did not create one. Portrait playback
+  fills the correct aspect after LibVLC reports its track dimensions. A rotated MOV crops
+  to 360 x 360 with no remaining rotation matrix; the first exported frame matches an
+  independent decode/crop at 2 seconds, and disabling audio removes the audio stream.
+
+Evidence: `evidence/editing-smoke/` and `evidence/editor-0.1.4/`. Run:
+
+```sh
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-editing.py --serial emulator-5554 --stylus
+# Optional real server request with credentials already configured through Luma's UI:
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-editing.py --serial emulator-5554 --qwen
+```
+
+Physical S26 Ultra pressure accuracy, palm rejection, latency, thermals, and Samsung AI
+editor availability remain unverified. The external-editor action hands off a copy;
+it does not expose Samsung's native image-generation models inside Luma. Photo exports
+are SDR and capped at 32 MP; Qwen inputs are capped at 1600 pixels on the longest side.
+HDR editing, animation editing, independently moving audio, and background video-export
+recovery are not implemented. Existing release checks below are historical, not new runs.
+
+## Previous Release Coverage
+
 Release: 0.1.4. Test date: 2026-10-03. Device: `emulator-5554`, Android 16, x86_64,
 1440 x 3120 at density 560, booted headless and read-only (`-read-only -no-window`), so
 test media and app changes were discarded on exit. The Galaxy S26 Ultra was not connected.

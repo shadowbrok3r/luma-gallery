@@ -9,12 +9,15 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.MediaMetadataRetriever;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.util.Size;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -52,6 +55,52 @@ final class MediaFiles {
     }
 
     Source source(String uri) throws IOException { return new Source(context.getContentResolver(), uri); }
+
+    /** Resolve a sender's URI using its temporary grant; no library permission is needed. */
+    JSONObject sharedItem(Uri uri, String hint) throws Exception {
+        if (!"content".equals(uri.getScheme()) && !"file".equals(uri.getScheme()))
+            throw new IOException("Share a local photo or video file");
+        // A sender must never use Luma's own access to expose private app files.
+        if ("file".equals(uri.getScheme())) {
+            File file = new File(uri.getPath()).getCanonicalFile();
+            File storage = android.os.Environment.getExternalStorageDirectory().getCanonicalFile();
+            if (!file.getPath().startsWith(storage.getPath() + File.separator))
+                throw new IOException("Share this file using a content URI");
+        }
+        ContentResolver resolver = context.getContentResolver();
+        String name = null, mime = resolver.getType(uri);
+        long size = 0;
+        try (Cursor cursor = resolver.query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                name = string(cursor, OpenableColumns.DISPLAY_NAME, "");
+                size = Math.max(0, number(cursor, OpenableColumns.SIZE));
+            }
+        } catch (IllegalArgumentException | UnsupportedOperationException ignored) {
+            // Some providers can open media but do not expose OpenableColumns.
+        }
+        if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+        if (name == null || name.isEmpty()) name = "Shared media";
+        if (mime == null || mime.equals("application/octet-stream")) mime = hint;
+        String kind = kind(name);
+        if ("image/x-adobe-dng".equals(mime)) {
+            kind = "raw";
+            if (!name.toLowerCase(Locale.ROOT).endsWith(".dng")) name += ".dng";
+        } else if ("image/x-sony-arw".equals(mime)) {
+            kind = "raw";
+        }
+        if (kind == null && mime != null) {
+            if (mime.startsWith("image/")) kind = "photo";
+            else if (mime.startsWith("video/")) kind = "video";
+        }
+        if (kind == null) throw new IOException("Only photos and videos can be opened");
+        try (Source readable = source(uri.toString())) {
+            if (size == 0) size = Math.max(0, readable.fd.getStatSize());
+        }
+        return new JSONObject().put("uri", uri.toString()).put("name", name).put("kind", kind)
+            .put("album", "Shared").put("size", size).put("modified", System.currentTimeMillis())
+            .put("width", 0).put("height", 0).put("duration", 0);
+    }
 
     File cached(String key, String suffix) throws Exception {
         byte[] digest = MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8));
@@ -109,9 +158,65 @@ final class MediaFiles {
 
     JSONObject probe(JSONObject item) throws Exception {
         try (Source src = source(item.getString("uri"))) {
-            String json = run("ffprobe", Arrays.asList("-v", "error", "-show_streams", "-show_format", "-of", "json", src.path), 30, null, null);
-            return new JSONObject(json);
+            return probeJson(Arrays.asList("-v", "error", "-show_streams", "-show_format", "-of", "json", src.path));
+        } catch (Exception error) {
+            // Playback and Android's extractors support formats beyond the bundled probe.
+            // Optional metadata must not turn a playable (including silent) video into an error.
+            android.util.Log.w("Luma", "Using Android video metadata", error);
+            return androidProbe(item);
         }
+    }
+
+    private JSONObject probeJson(List<String> arguments) throws Exception {
+        File output = File.createTempFile("probe-", ".json", cache);
+        try {
+            List<String> args = new ArrayList<>(arguments);
+            // MediaProcess merges diagnostic output. Keep warnings out of the JSON parser.
+            args.addAll(Arrays.asList("-o", output.getAbsolutePath()));
+            run("ffprobe", args, 30, null, null);
+            StringBuilder json = new StringBuilder();
+            try (Reader reader = new InputStreamReader(new FileInputStream(output), StandardCharsets.UTF_8)) {
+                char[] buffer = new char[8192]; int count;
+                while ((count = reader.read(buffer)) != -1) {
+                    if (json.length() + count > 4_000_000) throw new IOException("Video metadata is too large");
+                    json.append(buffer, 0, count);
+                }
+            }
+            return new JSONObject(json.toString());
+        } finally { output.delete(); }
+    }
+
+    private JSONObject androidProbe(JSONObject item) throws Exception {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(context, Uri.parse(item.getString("uri")), null);
+            JSONArray streams = new JSONArray();
+            long durationUs = item.optLong("duration") * 1000;
+            boolean video = false;
+            for (int n = 0; n < extractor.getTrackCount(); n++) {
+                MediaFormat format = extractor.getTrackFormat(n);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+                if (mime == null || !(mime.startsWith("video/") || mime.startsWith("audio/"))) continue;
+                JSONObject stream = new JSONObject().put("codec_type", mime.split("/")[0]).put("codec_name", mime);
+                if (format.containsKey(MediaFormat.KEY_DURATION)) durationUs = Math.max(durationUs, format.getLong(MediaFormat.KEY_DURATION));
+                if (mime.startsWith("video/")) {
+                    video = true;
+                    if (format.containsKey(MediaFormat.KEY_WIDTH)) stream.put("width", format.getInteger(MediaFormat.KEY_WIDTH));
+                    if (format.containsKey(MediaFormat.KEY_HEIGHT)) stream.put("height", format.getInteger(MediaFormat.KEY_HEIGHT));
+                    if (format.containsKey(MediaFormat.KEY_ROTATION)) stream.put("tags", new JSONObject().put("rotate", String.valueOf(format.getInteger(MediaFormat.KEY_ROTATION))));
+                    if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                        double rate;
+                        try { rate = format.getInteger(MediaFormat.KEY_FRAME_RATE); }
+                        catch (ClassCastException e) { rate = format.getFloat(MediaFormat.KEY_FRAME_RATE); }
+                        if (rate > 0) stream.put("avg_frame_rate", Math.round(rate * 1000) + "/1000");
+                    }
+                }
+                streams.put(stream);
+            }
+            if (!video) throw new IOException("Video details unavailable");
+            return new JSONObject().put("streams", streams)
+                .put("format", new JSONObject().put("duration", secondsUs(durationUs)));
+        } finally { extractor.release(); }
     }
 
     static final class CutPoint {
@@ -132,9 +237,9 @@ final class MediaFiles {
         for (int attempt = 0; attempt < 8; attempt++) {
             long seek = Math.max(0, timeMs - lookback);
             try (Source src = source(item.getString("uri"))) {
-                JSONObject data = new JSONObject(run("ffprobe", Arrays.asList("-v", "error", "-select_streams", "v:0",
+                JSONObject data = probeJson(Arrays.asList("-v", "error", "-select_streams", "v:0",
                     "-read_intervals", seconds(seek) + "%+#32", "-show_packets", "-show_entries", "packet=pts_time,dts_time,flags",
-                    "-of", "json", src.path), 30, null, null));
+                    "-of", "json", src.path));
                 JSONArray packets = data.optJSONArray("packets");
                 CutPoint candidate = null;
                 if (packets != null) for (int i = 0; i < packets.length(); i++) {
@@ -159,7 +264,8 @@ final class MediaFiles {
     }
 
     File thumbnail(JSONObject item, long at, int width) throws Exception {
-        File out = cached(identity(item) + ":" + at + ":" + width, ".jpg");
+        // Invalidate older Matroska previews that Android snapped to keyframes.
+        File out = cached(identity(item) + ":frame-v2:" + at + ":" + width, ".jpg");
         if (out.length() > 0) { out.setLastModified(System.currentTimeMillis()); return out; }
         File work = new File(cache, out.getName() + "." + Thread.currentThread().getId() + ".pending.jpg");
         try {
@@ -176,8 +282,9 @@ final class MediaFiles {
         if ("video".equals(kind)) {
             try (MediaMetadataRetriever retriever = new MediaMetadataRetriever()) {
                 retriever.setDataSource(context, uri);
-                bitmap = retriever.getScaledFrameAtTime(Math.max(0, at) * 1000,
-                    MediaMetadataRetriever.OPTION_CLOSEST, width, Math.max(1, width * 9 / 16));
+                if (preciseNativeSeek(retriever))
+                    bitmap = retriever.getScaledFrameAtTime(Math.max(0, at) * 1000,
+                        MediaMetadataRetriever.OPTION_CLOSEST, width, Math.max(1, width * 9 / 16));
             } catch (Exception ignored) { }
         } else if (!"raw".equals(kind)) {
             try { bitmap = context.getContentResolver().loadThumbnail(uri, new Size(width, width), null); }
@@ -223,7 +330,14 @@ final class MediaFiles {
         return out;
     }
 
-    File developRaw(JSONObject item, AtomicReference<Process> running) throws Exception {
+    static boolean preciseNativeSeek(MediaMetadataRetriever retriever) {
+        String mime = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE);
+        // Android's Matroska extractor can return only a preceding keyframe even
+        // with OPTION_CLOSEST. Decode forward in FFmpeg for these containers.
+        return mime == null || !(mime.contains("webm") || mime.contains("matroska"));
+    }
+
+    synchronized File developRaw(JSONObject item, AtomicReference<Process> running) throws Exception {
         File output = cached(identity(item) + (isDng(item) ? ":dng-full-v1" : ":full-v1"), ".jpg");
         if (output.length() > 0) return output;
         File ppm = cached(identity(item), ".ppm");
@@ -355,7 +469,7 @@ final class MediaFiles {
         String lower = name.toLowerCase(Locale.ROOT);
         if (lower.endsWith(".arw") || lower.endsWith(".dng")) return "raw";
         if (lower.matches(".*\\.(mp4|mov|m4v|mkv|webm|avi)$")) return "video";
-        if (lower.matches(".*\\.(jpe?g|png|webp|heic|heif|avif|bmp)$")) return "photo";
+        if (lower.matches(".*\\.(jpe?g|png|webp|heic|heif|avif|bmp|gif)$")) return "photo";
         return null;
     }
     static String string(Cursor cursor, String name, String fallback) {

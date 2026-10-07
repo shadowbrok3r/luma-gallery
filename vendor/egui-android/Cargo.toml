@@ -1,0 +1,44 @@
+# Vendored from EguiMobile ad77e546885aa4a9238f9a7f4ea337243da2eddc.
+# Local toolbar layout patch; see UPSTREAM. Shared dependencies are pinned for Luma.
+[package]
+name = "egui-android"
+description = "Android backend for egui-mobile: android_main + eframe(wgpu) render loop + JNI Host capability bridge."
+edition = "2024"
+version = "0.1.4"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shadowbrok3r/EguiMobile"
+
+[dependencies]
+egui = "0.36"
+egui-mobile-core = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "31d1cbebead2ea9c52e50e4b6602c2b1f90c6abd" }
+# BOTH renderers are compiled and the choice is made at RUNTIME, never by a cargo feature: a
+# workspace-wide check unifies features, and a cfg-based choice would then build one egui-android
+# rlib with glow selected — silently blanking comfyui and every plugin viewport. `wgpu` must stay
+# on regardless, because the `plugins` block names `CreationContext::wgpu_render_state`.
+eframe = { version = "0.36", default-features = false, features = [
+    "android-native-activity",
+    "wgpu",
+    "glow",
+    "default_fonts",
+] }
+# Same 0.17 that egui_glow 0.36 pins, so there is one glow in the graph.
+glow = "0.17"
+egui_glow = "0.36"
+android-activity = { version = "0.6", features = ["native-activity"] }
+# Capability bridge: call Android APIs from Rust. jni 0.21 (stable, well-documented) drives the
+# calls; the raw JavaVM/Activity come from ndk-context (version-agnostic), so android-activity's
+# internal jni 0.22 is irrelevant.
+jni = "0.21"
+ndk-context = "0.1"
+log = "0.4"
+android_logger = "0.15"
+# WASM plugin runtime (feature `plugins`), shared with iOS. Pulley interpreter on Android too.
+egui-ios-plugin-host = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "31d1cbebead2ea9c52e50e4b6602c2b1f90c6abd", optional = true }
+postcard = { version = "1", features = ["use-std"], optional = true }
+
+[features]
+plugins = ["dep:egui-ios-plugin-host", "egui-ios-plugin-host/net", "dep:postcard"]
+
+[lib]
+# rlib: the app crate is the cdylib that exports `android_main` (via the `app!` macro).
+crate-type = ["rlib"]

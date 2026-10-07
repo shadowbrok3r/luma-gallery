@@ -10,6 +10,13 @@ public final class GalleryActivity extends EguiNativeActivity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         gallery = new GalleryController(this);
+        gallery.receive(getIntent());
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (gallery != null) gallery.receive(intent);
     }
 
     public void galleryCommand(String json) {

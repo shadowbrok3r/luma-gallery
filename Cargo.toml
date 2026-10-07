@@ -1,6 +1,6 @@
 [package]
 name = "luma_gallery"
-version = "0.1.4"
+version = "0.1.11"
 edition = "2024"
 publish = false
 license = "GPL-3.0-or-later"
@@ -22,6 +22,9 @@ jni = "0.21"
 
 [patch.crates-io]
 android-activity = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "31d1cbebead2ea9c52e50e4b6602c2b1f90c6abd" }
+
+[patch."https://github.com/shadowbrok3r/EguiMobile"]
+egui-android = { path = "vendor/egui-android" }
 
 [profile.release]
 lto = "thin"
@@ -48,9 +51,12 @@ label = "Luma Gallery"
 icon = "@mipmap/ic_launcher"
 has_code = true
 extract_native_libs = true
+uses_cleartext_traffic = true
 
 [[package.metadata.android.application.activity]]
 name = "app.luma.gallery.GalleryActivity"
+exported = true
+launch_mode = "singleTask"
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
 window_soft_input_mode = "adjustResize"
 [[package.metadata.android.application.activity.meta_data]]
@@ -59,6 +65,16 @@ value = "luma_gallery"
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
 categories = ["android.intent.category.LAUNCHER"]
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT"]
+data = [{ mime_type = "image/*" }, { mime_type = "video/*" }]
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.SEND", "android.intent.action.SEND_MULTIPLE"]
+categories = ["android.intent.category.DEFAULT"]
+data = [{ mime_type = "image/*" }, { mime_type = "video/*" }]
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_MEDIA_IMAGES"
@@ -75,3 +91,5 @@ name = "android.permission.MANAGE_MEDIA"
 name = "android.permission.VIBRATE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.WAKE_LOCK"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"

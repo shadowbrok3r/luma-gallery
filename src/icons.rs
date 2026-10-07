@@ -13,6 +13,7 @@ pub fn source(name: &str) -> &'static [u8] {
         "star",
         "video",
         "photo",
+        "camera",
         "raw",
         "search",
         "sort",
@@ -45,7 +46,15 @@ pub fn source(name: &str) -> &'static [u8] {
         "more",
         "select",
         "select_all",
-        "restore"
+        "restore",
+        "crop",
+        "rotate",
+        "flip",
+        "brush",
+        "eraser",
+        "undo",
+        "sparkles",
+        "waveform"
     )
 }
 

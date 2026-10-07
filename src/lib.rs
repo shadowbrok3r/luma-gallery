@@ -1,6 +1,8 @@
 mod app;
 mod bridge;
+mod edit;
 mod icons;
+mod mask;
 mod model;
 
 use egui::Color32;

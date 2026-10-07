@@ -62,14 +62,14 @@ final class PhotoView extends View {
     }
 
     void load(String path, boolean alreadyOriented) {
-        load(path, null, alreadyOriented);
+        load(path, null, null, alreadyOriented);
     }
 
-    void load(java.io.FileDescriptor input) {
-        load(null, input, false);
+    void load(java.io.FileDescriptor input, android.net.Uri uri) {
+        load(null, input, uri, false);
     }
 
-    private void load(String path, java.io.FileDescriptor input, boolean alreadyOriented) {
+    private void load(String path, java.io.FileDescriptor input, android.net.Uri uri, boolean alreadyOriented) {
         final long token = ++generation;
         tiles.execute(() -> {
             BitmapRegionDecoder next = null;
@@ -101,7 +101,31 @@ final class PhotoView extends View {
                 });
             } catch (Exception e) {
                 if (next != null) next.recycle();
-                if (token == generation) owner.error("Photo: " + e.getMessage());
+                if (low != null) low.recycle();
+                // Region decoding excludes GIF/BMP and some platform-supported formats.
+                // Keep the fallback bounded, oriented, and usable as a still-photo editor source.
+                try {
+                    int[] dimensions = new int[2];
+                    ImageDecoder.Source src = uri == null ? ImageDecoder.createSource(new java.io.File(path))
+                        : ImageDecoder.createSource(getContext().getContentResolver(), uri);
+                    Bitmap fallback = ImageDecoder.decodeBitmap(src, (d, info, unused) -> {
+                        int w=info.getSize().getWidth(), h=info.getSize().getHeight();
+                        dimensions[0]=w; dimensions[1]=h;
+                        double factor=Math.min(1.0,3200.0/Math.max(w,h));
+                        d.setTargetSize(Math.max(1,(int)(w*factor)),Math.max(1,(int)(h*factor)));
+                        d.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                    });
+                    post(() -> {
+                        if(token!=generation){fallback.recycle();return;}
+                        BitmapRegionDecoder old=decoder; decoder=null; preview=fallback;
+                        imageWidth=fallback.getWidth(); imageHeight=fallback.getHeight(); rotation=0; mirror=false;
+                        cache.evictAll();pending.clear();fitImage();
+                        if(old!=null)tiles.execute(old::recycle);
+                        owner.photoPreviewReady(this,dimensions[0],dimensions[1]);invalidate();
+                    });
+                } catch(Exception | OutOfMemoryError failed) {
+                    if (token == generation) owner.error("Photo: " + failed.getMessage());
+                }
             }
         });
     }
@@ -126,7 +150,7 @@ final class PhotoView extends View {
         int action = event.getActionMasked();
         if (action == MotionEvent.ACTION_DOWN) {
             touchStartX = event.getX(); touchStartY = event.getY();
-            swipeCandidate = decoder != null && scale <= fit * 1.02f;
+            swipeCandidate = preview != null && scale <= fit * 1.02f;
         }
         // A pinch never turns into navigation when the second finger is lifted.
         if (event.getPointerCount() > 1 || action == MotionEvent.ACTION_CANCEL) swipeCandidate = false;
@@ -144,7 +168,7 @@ final class PhotoView extends View {
     }
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        if (decoder == null || preview == null || scale <= 0) return;
+        if (preview == null || scale <= 0) return;
         Matrix transform = new Matrix();
         transform.postTranslate(-imageWidth/2f, -imageHeight/2f);
         transform.postScale(mirror ? -1 : 1, 1);
@@ -156,6 +180,7 @@ final class PhotoView extends View {
         visible.intersect(0,0,imageWidth,imageHeight);
         canvas.save(); canvas.concat(transform);
         canvas.drawBitmap(preview, null, new Rect(0,0,imageWidth,imageHeight), paint);
+        if(decoder==null){canvas.restore();return;}
         int sample = 1;
         while (sample * 2 * scale <= 1) sample *= 2;
         int edge = 512 * sample;

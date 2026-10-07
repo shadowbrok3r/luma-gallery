@@ -26,12 +26,18 @@ final class GalleryController {
     private final MediaFiles files;
     private final ConcurrentLinkedQueue<JSONObject> events = new ConcurrentLinkedQueue<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService incoming = Executors.newSingleThreadExecutor();
+    private final AtomicLong incomingGeneration = new AtomicLong();
     private final ThreadPoolExecutor thumbs = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
     private final ExecutorService previews = Executors.newSingleThreadExecutor();
     private final ExecutorService photos = Executors.newSingleThreadExecutor();
     private final ExecutorService exports = Executors.newSingleThreadExecutor();
     private final ExecutorService changes = Executors.newSingleThreadExecutor();
     private final MediaManager manager;
+    private final PhotoEdits edits;
+    private final QwenEdits qwen;
+    private final AudioWaveform waveform;
+    private final VideoFrames frames;
     private static final int REQUEST_CONSENT = 702;
     private volatile CompletableFuture<Boolean> consent;
     private volatile boolean managing, manageMedia, rescan;
@@ -43,7 +49,15 @@ final class GalleryController {
     private final AtomicBoolean exportCancelled = new AtomicBoolean();
     private final AtomicLong previewGeneration = new AtomicLong();
     private final AtomicBoolean previewBusy = new AtomicBoolean();
-    private volatile JSONObject previewRequest;
+    private volatile PreviewRequest previewRequest;
+    private static final class PreviewRequest {
+        final JSONObject item;
+        final long session, time;
+        final String label;
+        PreviewRequest(JSONObject item, long session, long time, String label) {
+            this.item = item; this.session = session; this.time = time; this.label = label;
+        }
+    }
     private volatile JSONObject selected;
     private volatile JSONObject playback = new JSONObject();
     private volatile boolean closed, scanning, exporting;
@@ -76,6 +90,10 @@ final class GalleryController {
         this.activity = activity;
         files = new MediaFiles(activity);
         manager = new MediaManager(activity);
+        edits = new PhotoEdits(activity, files, this::emit, this::scan);
+        qwen = new QwenEdits(edits, this::emit);
+        waveform = new AudioWaveform(files, this::emit);
+        frames = new VideoFrames(activity, files, this::emit, this::scan);
         refreshAccess();
         root = activity.findViewById(android.R.id.content);
         audio = (AudioManager) activity.getSystemService(Context.AUDIO_SERVICE);
@@ -124,7 +142,9 @@ final class GalleryController {
                 .put("access", files.access()).put("exporting", exporting).put("progress", exportProgress)
                 .put("export_status", exportStatus).put("export_uri", exportUri).put("sdk", Build.VERSION.SDK_INT)
                 .put("manage_media", manageMedia).put("managing", managing).put("manage_status", manageStatus)
-                .put("manage_progress", manageProgress).toString();
+                .put("manage_progress", manageProgress).put("photo_saving", edits.busy).put("photo_edit_status", edits.status)
+                .put("qwen_busy", qwen.busy).put("qwen_status", qwen.status)
+                .put("frame_saving", frames.busy).toString();
         } catch (Exception e) { return "{}"; }
     }
 
@@ -155,10 +175,28 @@ final class GalleryController {
                         case "rate": speed = (float)data.getDouble("rate"); if (player != null) player.setRate(speed); break;
                         case "loop": loop = data.getBoolean("enabled"); loopStart = data.optLong("start"); loopEnd = data.optLong("end"); break;
                         case "preview": showPreview(data); break;
-                        case "preview_end": previewGeneration.incrementAndGet(); previewRequest = null; if (loupe != null) loupe.dismiss(); break;
+                        case "preview_end": endPreview(); break;
                         case "zoom": if (photo != null) photo.zoom((float)data.optDouble("scale", 0)); break;
                         case "keyframe": locateKeyframe(data); break;
                         case "export": export(data, false); break;
+                        case "capture_frame":
+                            if (selected != null && "video".equals(selected.optString("kind"))
+                                    && selected.optString("uri").equals(data.optString("uri"))) {
+                                // While playing, sample the clock on the player thread at the tap.
+                                // A paused/pending seek uses the exact position chosen in the UI.
+                                long at = player != null && player.isPlaying() ? player.getTime() : data.optLong("time");
+                                if (player != null) player.pause();
+                                frames.save(new JSONObject(selected.toString()), Math.max(0, at));
+                            }
+                            break;
+                        case "photo_prepare": edits.prepare(data); break;
+                        case "photo_save": edits.save(data); break;
+                        case "photo_external": edits.external(data); break;
+                        case "qwen_config": qwen.config(data); break;
+                        case "qwen_edit": qwen.run(data,false); break;
+                        case "qwen_resume": qwen.run(data,true); break;
+                        case "qwen_stop": qwen.stop(); break;
+                        case "waveform": waveform.read(data.getJSONObject("item")); break;
                         case "proxy": export(data, true); break;
                         case "cancel_export": exportCancelled.set(true); Process process = exportProcess.get(); if (process != null) process.destroyForcibly(); break;
                         case "share": share(data.optString("uri")); break;
@@ -176,6 +214,60 @@ final class GalleryController {
     }
 
     /** Scans the library; a request during a scan runs once more afterwards. */
+    /** Cold launches and warm onNewIntent deliveries use the same queued UI event. */
+    void receive(Intent intent) {
+        if (intent == null || closed) return;
+        String action = intent.getAction();
+        if (!Intent.ACTION_VIEW.equals(action) && !Intent.ACTION_SEND.equals(action)
+                && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return;
+        long request = incomingGeneration.incrementAndGet();
+        Set<Uri> uris = new LinkedHashSet<>();
+        try {
+            if (Intent.ACTION_VIEW.equals(action)) {
+                if (intent.getData() != null) uris.add(intent.getData());
+            } else {
+                if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+                    ArrayList<?> streams = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+                    if (streams != null) for (Object stream : streams) if (stream instanceof Uri) uris.add((Uri)stream);
+                } else {
+                    Object stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+                    if (stream instanceof Uri) uris.add((Uri)stream);
+                }
+                // ClipData is also used by senders that omit EXTRA_STREAM.
+                ClipData clip = intent.getClipData();
+                if (clip != null) for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri uri = clip.getItemAt(i).getUri();
+                    if (uri != null) uris.add(uri);
+                }
+            }
+        } catch (RuntimeException e) {
+            error("Couldn't read this share. Try sharing the photo or video again.");
+            return;
+        }
+        String mime = intent.getType();
+        incoming.execute(() -> {
+            JSONArray items = new JSONArray();
+            int skipped = 0;
+            for (Uri uri : uris) {
+                if (closed || incomingGeneration.get() != request) return;
+                try { items.put(files.sharedItem(uri, mime)); }
+                catch (Exception e) { skipped++; }
+            }
+            final int failed = skipped;
+            // Checking on the main thread prevents an older slow provider replacing a newer share.
+            main.post(() -> {
+                if (closed || incomingGeneration.get() != request) return;
+                if (items.length() == 0) {
+                    error("Couldn't open this share. Share a readable photo or video from the source app again.");
+                    return;
+                }
+                try { emit(new JSONObject().put("type", "incoming").put("items", items)); }
+                catch (JSONException ignored) { }
+                if (failed > 0) error("Opened " + items.length() + "; " + failed + " unavailable or unsupported files skipped.");
+            });
+        });
+    }
+
     void scan() {
         synchronized (this) {
             if (closed) return;
@@ -195,6 +287,7 @@ final class GalleryController {
     }
 
     void activityResult(int request, int result, Intent data) {
+        if (request == 703) { scan(); return; }
         if (request == REQUEST_CONSENT) {
             CompletableFuture<Boolean> answer = consent;
             if (answer != null) answer.complete(result == Activity.RESULT_OK);
@@ -285,10 +378,14 @@ final class GalleryController {
             output.attachViews((vout,w,h,vw,vh,sn,sd) -> {
                 if (token != generation) return;
                 videoWidth = vw > 0 ? vw : w; videoHeight = vh > 0 ? vh : h;
+                videoTrackSize();
                 layoutStage();
             });
             player.setEventListener(event -> {
                 if (token != generation) return;
+                if(event.type==MediaPlayer.Event.Playing || event.type==MediaPlayer.Event.Vout) {
+                    videoTrackSize(); layoutStage();
+                }
                 if (event.type == MediaPlayer.Event.EncounteredError) {
                     playbackError = "This recording could not play. Try a playback proxy.";
                     error(playbackError);
@@ -304,8 +401,16 @@ final class GalleryController {
             player.setVolume(muted ? 0 : 100); player.setRate(speed);
             layoutStage(); togglePlay(true);
             io.execute(() -> {
-                try { emit(new JSONObject().put("type", "metadata").put("uri", item.getString("uri")).put("probe", files.probe(item))); }
-                catch (Exception e) { error("Metadata: " + e.getMessage()); }
+                try {
+                    JSONObject metadata = files.probe(item);
+                    if (token == generation) emit(new JSONObject().put("type", "metadata").put("uri", item.getString("uri")).put("probe", metadata));
+                } catch (Exception e) {
+                    android.util.Log.w("Luma", "Optional video details unavailable", e);
+                    if (token == generation) try {
+                        emit(new JSONObject().put("type", "metadata").put("uri", item.optString("uri"))
+                            .put("probe", new JSONObject().put("error", "Additional video details unavailable")));
+                    } catch (Exception ignored) { }
+                }
             });
         } else {
             photo = new PhotoView(activity, this);
@@ -328,7 +433,7 @@ final class GalleryController {
             } else {
                 source = files.source(item.getString("uri"));
                 photoStatus = "Full resolution";
-                photo.load(source.fd.getFileDescriptor());
+                photo.load(source.fd.getFileDescriptor(),Uri.parse(item.getString("uri")));
             }
         }
     }
@@ -360,18 +465,34 @@ final class GalleryController {
         if (player != null) player.getVLCVout().setWindowSize(width,height);
     }
 
+    /** Hardware Surface output may not report a new-video-layout callback. */
+    private void videoTrackSize() {
+        org.videolan.libvlc.interfaces.IMedia.VideoTrack track=player==null?null:player.getCurrentVideoTrack();
+        if(track==null || track.width<=0 || track.height<=0)return;
+        videoWidth=track.width;videoHeight=track.height;
+        if(track.orientation>=org.videolan.libvlc.interfaces.IMedia.VideoTrack.Orientation.LeftTop) {
+            int swap=videoWidth;videoWidth=videoHeight;videoHeight=swap;
+        }
+        android.util.Log.d("LumaVideo","Track "+track.width+"x"+track.height+" orientation="+track.orientation+" surface="+videoWidth+"x"+videoHeight);
+    }
+
     private void togglePlay(boolean play) {
         if (player == null) return;
         if (play) { if (audio.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) player.play(); }
         else player.pause();
     }
 
-    void pause() { main.post(() -> { if (player != null) player.pause(); if (loupe != null) loupe.dismiss(); }); }
+    void pause() { main.post(() -> { if (player != null) player.pause(); endPreview(); }); }
 
     void photoReady(PhotoView origin,int width,int height) {
         if (photo != origin || selected == null) return;
         try { emit(new JSONObject().put("type", "photo").put("uri", selected.optString("uri")).put("width", width).put("height", height).put("status", photoStatus)); }
         catch (Exception ignored) { }
+    }
+
+    void photoPreviewReady(PhotoView origin,int width,int height) {
+        if(photo!=origin)return;
+        photoStatus="Still preview"; photoReady(origin,width,height);
     }
 
     void navigatePhoto(PhotoView origin,int delta) {
@@ -381,9 +502,9 @@ final class GalleryController {
     }
 
     private void closeMedia() {
+        waveform.cancel();
         generation++;
-        previewGeneration.incrementAndGet(); previewRequest = null;
-        if (loupe != null) loupe.dismiss();
+        endPreview();
         Process raw = rawProcess.get(); if (raw != null) raw.destroyForcibly();
         if (player != null) { player.setEventListener(null); player.stop(); player.getVLCVout().detachViews(); player.release(); player = null; }
         if (surface != null) { root.removeView(surface); surface = null; }
@@ -396,7 +517,8 @@ final class GalleryController {
     }
 
     private void showPreview(JSONObject request) throws Exception {
-        if (selected == null) return;
+        if (selected == null || !"video".equals(selected.optString("kind"))
+                || !selected.optString("uri").equals(request.optString("uri"))) return;
         if (loupe == null) {
             LinearLayout content = new LinearLayout(activity); content.setOrientation(LinearLayout.VERTICAL);
             float density = activity.getResources().getDisplayMetrics().density;
@@ -413,32 +535,60 @@ final class GalleryController {
         int x = request.getInt("x"), y = request.getInt("y");
         if (loupe.isShowing()) loupe.update(x,y,request.getInt("w"),request.getInt("h"));
         else loupe.showAtLocation(root, Gravity.TOP | Gravity.LEFT, x,y);
-        loupeTime.setText(request.optString("label"));
-        request.put("item", selected);
-        previewRequest = request;
-        previewGeneration.incrementAndGet();
+        long time = Math.max(0, request.optLong("time"));
+        String label = request.optString("label");
+        PreviewRequest previous = previewRequest;
+        if (previous != null && previous.time == time && previous.label.equals(label)) return;
+        if (previous == null) {
+            loupeImage.setImageDrawable(null);
+            loupeTime.setText("Loading frame…");
+        }
+        previewRequest = new PreviewRequest(new JSONObject(selected.toString()),
+            previewGeneration.get(), time, label);
         startPreviewWorker();
+    }
+
+    private void endPreview() {
+        previewGeneration.incrementAndGet();
+        previewRequest = null;
+        if (loupe != null) loupe.dismiss();
+        if (loupeImage != null) loupeImage.setImageDrawable(null);
     }
 
     private void startPreviewWorker() {
         if (!previewBusy.compareAndSet(false,true)) return;
         previews.execute(() -> {
-            long completed = -1;
+            PreviewRequest completed = null;
             try {
                 while (!closed) {
-                    JSONObject request = previewRequest;
-                    long token = previewGeneration.get();
-                    if (request == null || token == completed) break;
-                    completed = token;
+                    PreviewRequest request = previewRequest;
+                    if (request == null || request == completed) break;
+                    completed = request;
                     try {
-                        File image = files.thumbnail(request.getJSONObject("item"), request.optLong("time"), 384);
+                        File image = files.thumbnail(request.item, request.time, 384);
                         Bitmap bitmap = BitmapFactory.decodeFile(image.getAbsolutePath());
-                        main.post(() -> { if (token == previewGeneration.get() && loupe != null && loupe.isShowing()) loupeImage.setImageBitmap(bitmap); });
-                    } catch (Exception ignored) { }
+                        if (bitmap == null) throw new IOException("Could not decode preview");
+                        main.post(() -> {
+                            // Publish progress within this gesture, then decode the latest request.
+                            // Rejecting every superseded time starves slow decoders while dragging.
+                            if (request.session == previewGeneration.get() && loupe != null && loupe.isShowing()) {
+                                loupeImage.setImageBitmap(bitmap);
+                                loupeTime.setText(request.label);
+                            } else bitmap.recycle();
+                        });
+                    } catch (Exception error) {
+                        android.util.Log.w("Luma", "Scrub preview unavailable", error);
+                        main.post(() -> {
+                            if (previewRequest == request && request.session == previewGeneration.get()) {
+                                loupeImage.setImageDrawable(null);
+                                loupeTime.setText("Preview unavailable");
+                            }
+                        });
+                    }
                 }
             } finally {
                 previewBusy.set(false);
-                if (previewRequest != null && completed != previewGeneration.get()) startPreviewWorker();
+                if (!closed && previewRequest != null && completed != previewRequest) startPreviewWorker();
             }
         });
     }
@@ -459,7 +609,10 @@ final class GalleryController {
         if (item == null || !"video".equals(item.optString("kind"))) return;
         final long requestedStart = proxy ? 0 : request.getLong("start");
         final long requestedEnd = proxy ? Math.max(item.optLong("duration"), playback.optLong("duration")) : request.getLong("end");
-        final boolean exact = !proxy && request.optBoolean("exact");
+        final JSONObject crop = proxy ? null : request.optJSONObject("crop");
+        final boolean hasCrop = crop != null && (crop.optDouble("left",0)>0 || crop.optDouble("top",0)>0 || crop.optDouble("right",1)<1 || crop.optDouble("bottom",1)<1);
+        final boolean exact = !proxy && (request.optBoolean("exact") || hasCrop);
+        final boolean keepAudio = proxy || request.optBoolean("audio",true);
         if (requestedEnd <= requestedStart) throw new IOException("The clip must end after it starts");
         exporting = true; exportProgress=0; exportStatus = proxy ? "Building playback proxy" : "Exporting clip"; exportUri="";
         exportCancelled.set(false);
@@ -481,10 +634,19 @@ final class GalleryController {
                 // stream-copy output seek compares DTS; trim that preroll without decoding video.
                 if (!exact && !proxy && cut.decodeUs > 0)
                     args.addAll(Arrays.asList("-ss", MediaFiles.secondsUs(cut.decodeUs - inputSeekUs)));
-                args.addAll(Arrays.asList("-t",MediaFiles.secondsUs(lengthUs),"-map","0:v:0","-map","0:a?","-map_metadata","0"));
+                args.addAll(Arrays.asList("-t",MediaFiles.secondsUs(lengthUs),"-map","0:v:0"));
+                if (keepAudio) args.addAll(Arrays.asList("-map","0:a?"));
+                args.addAll(Arrays.asList("-map_metadata","0"));
                 if (exact || proxy) {
                     args.addAll(Arrays.asList("-c:v","libx264","-preset","veryfast","-crf",proxy ? "21" : "18","-threads","4"));
                     if (proxy) args.addAll(Arrays.asList("-vf","scale=w='min(1920,iw)':h=-2:flags=fast_bilinear","-pix_fmt","yuv420p"));
+                    else if (hasCrop) {
+                        double left=crop.getDouble("left"),top=crop.getDouble("top"),right=crop.getDouble("right"),bottom=crop.getDouble("bottom");
+                        if (!Double.isFinite(left+top+right+bottom) || left<0 || top<0 || right>1 || bottom>1 || right-left<0.01 || bottom-top<0.01)
+                            throw new IOException("Invalid video crop");
+                        String filter=String.format(Locale.ROOT,"crop=w='max(2,trunc(iw*%.8f/2)*2)':h='max(2,trunc(ih*%.8f/2)*2)':x='trunc(iw*%.8f/2)*2':y='trunc(ih*%.8f/2)*2'",right-left,bottom-top,left,top);
+                        args.addAll(Arrays.asList("-vf",filter,"-pix_fmt","yuv420p"));
+                    }
                 } else args.addAll(Arrays.asList("-c:v","copy"));
                 args.addAll(Arrays.asList("-c:a","aac","-b:a","256k","-avoid_negative_ts","make_zero","-movflags","+faststart",
                     "-progress","pipe:1","-nostats",output.getAbsolutePath()));
@@ -582,12 +744,13 @@ final class GalleryController {
     }
 
     void close() {
+        edits.close(); qwen.close(); waveform.close(); frames.close();
         closed=true; main.removeCallbacks(tick); closeMedia();
         Process process=exportProcess.get(); if(process!=null) process.destroyForcibly();
         CompletableFuture<Boolean> answer=consent; if(answer!=null) answer.complete(false);
         manager.cancelled.set(true);
         try{activity.unregisterReceiver(noisy);}catch(Exception ignored){}
-        io.shutdownNow(); thumbs.shutdownNow(); previews.shutdownNow(); photos.shutdownNow(); exports.shutdownNow(); changes.shutdownNow();
+        incoming.shutdownNow(); io.shutdownNow(); thumbs.shutdownNow(); previews.shutdownNow(); photos.shutdownNow(); exports.shutdownNow(); changes.shutdownNow();
         if(vlc!=null) vlc.release();
     }
 }

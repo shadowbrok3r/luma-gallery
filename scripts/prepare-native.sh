@@ -67,29 +67,29 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                 make install-lib-static
             )
         fi
-        if [ ! -f ".build/$archabi/ffmpeg-image-ready" ]; then
+        if [ ! -f ".build/$archabi/ffmpeg-editor-v1-ready" ]; then
             (
                 cd ".build/$archabi/ffmpeg"
                 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
                 "$root/native/vendor/ffmpeg-8.0.1/configure" --prefix="$prefix" \
                     --target-os=android --arch="$arch" --enable-cross-compile \
                     --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
-                    --pkg-config=pkg-config --enable-gpl --enable-libx264 --enable-pic \
+                    --pkg-config=pkg-config --enable-gpl --enable-libx264 --enable-zlib --enable-pic \
                     --disable-shared --enable-static --disable-debug --disable-doc --disable-network \
                     --disable-autodetect --disable-everything --enable-ffmpeg --enable-ffprobe \
                     --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale --enable-swresample \
                     --enable-protocol=file,pipe,fd --enable-demuxer=mov,matroska,avi,image2,image_jpeg_pipe,image_png_pipe,image_ppm_pipe,wav \
                     --enable-muxer=mp4,mov,image2,null \
                     --enable-decoder=h264,hevc,aac,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32le,mjpeg,png,ppm,rawvideo,flac,mp3,opus,vorbis,vp8,vp9,av1 \
-                    --enable-encoder=libx264,aac,mjpeg,png --enable-parser=h264,hevc,aac,mjpeg,vp8,vp9,av1 \
+                    --enable-encoder=libx264,aac,mjpeg,png,pcm_s16le --enable-parser=h264,hevc,aac,mjpeg,vp8,vp9,av1 \
                     --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
-                    --enable-filter=scale,format,fps,trim,atrim,setpts,asetpts,aresample,aformat,null,anull,transpose,rotate \
+                    --enable-filter=scale,format,fps,trim,atrim,setpts,asetpts,aresample,aformat,null,anull,transpose,rotate,crop,volume,astats,ametadata,asetnsamples \
                     --extra-cflags="-I$prefix/include -O3" \
                     --extra-ldflags="-L$prefix/lib -pie -Wl,-z,max-page-size=16384"
                 make -j"$jobs"
                 cp ffmpeg "$root/native/libs/$archabi/libffmpeg_exec.so"
                 cp ffprobe "$root/native/libs/$archabi/libffprobe_exec.so"
-                touch "$root/.build/$archabi/ffmpeg-image-ready"
+                touch "$root/.build/$archabi/ffmpeg-editor-v1-ready"
             )
         fi
         if [ ! -f "$prefix/lib/libraw.a" ]; then

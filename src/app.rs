@@ -1,9 +1,9 @@
+mod editor;
 mod manage;
 
 use crate::{ACCENT, BG, LINE, MUTED, PANEL, TEXT, TRIM, bridge, icons, model::*};
 use egui::{
-    self, Align, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2,
-    vec2,
+    self, Align, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
 };
 use egui_mobile::{CreateContext, EguiApp, Host};
 use manage::Dialog;
@@ -24,6 +24,8 @@ const ACTION_BAR: f32 = 56.0;
 pub struct Gallery {
     items: Vec<MediaItem>,
     trash: Vec<MediaItem>,
+    shared: Vec<MediaItem>,
+    pending_shared: Option<Vec<MediaItem>>,
     selection: Selection,
     dialog: Option<Dialog>,
     menu_open: bool,
@@ -61,6 +63,12 @@ pub struct Gallery {
     last_rect: Option<(i32, i32, i32, i32, bool)>,
     last_preview: Instant,
     proxy: bool,
+    editor: Option<editor::PhotoEditor>,
+    video_crop: crate::edit::Crop,
+    crop_video: bool,
+    crop_drag: Option<editor::CropDrag>,
+    keep_audio: bool,
+    waveform: crate::edit::Waveform,
     #[cfg(target_os = "android")]
     gpu: Option<egui_mobile::video::GpuVideoSurface>,
     #[cfg(target_os = "android")]
@@ -72,6 +80,8 @@ impl Gallery {
         Self {
             items: vec![],
             trash: vec![],
+            shared: vec![],
+            pending_shared: None,
             selection: Selection::default(),
             dialog: None,
             menu_open: false,
@@ -109,6 +119,12 @@ impl Gallery {
             last_rect: None,
             last_preview: Instant::now() - Duration::from_secs(1),
             proxy: false,
+            editor: None,
+            video_crop: crate::edit::Crop::default(),
+            crop_video: false,
+            crop_drag: None,
+            keep_audio: true,
+            waveform: crate::edit::Waveform::default(),
             #[cfg(target_os = "android")]
             gpu: None,
             #[cfg(target_os = "android")]
@@ -140,7 +156,32 @@ impl Gallery {
             .cloned()
             .unwrap_or_default();
         for event in events {
+            if let Some(editor) = &mut self.editor {
+                editor.event(ctx, &event);
+            }
             match event["type"].as_str().unwrap_or_default() {
+                "incoming" => {
+                    if let Ok(items) =
+                        serde_json::from_value::<Vec<MediaItem>>(event["items"].clone())
+                        && !items.is_empty()
+                    {
+                        self.receive_shared(items);
+                    }
+                }
+                "waveform" => {
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|i| Some(i.uri.as_str()) == event["uri"].as_str())
+                    {
+                        self.waveform = crate::edit::Waveform {
+                            peaks: serde_json::from_value(event["peaks"].clone())
+                                .unwrap_or_default(),
+                            step_ms: event["step_ms"].as_f64().unwrap_or(0.0),
+                            status: event["status"].as_str().unwrap_or_default().into(),
+                        };
+                    }
+                }
                 "library" => {
                     if let Ok(items) = serde_json::from_value(event["items"].clone()) {
                         self.items = items;
@@ -207,6 +248,22 @@ impl Gallery {
                                     item.height =
                                         video["height"].as_u64().unwrap_or(item.height as u64)
                                             as u32;
+                                    // FFmpeg crops after autorotation; the canvas must use
+                                    // the displayed orientation too (portrait phone MOVs).
+                                    let rotation = video["side_data_list"]
+                                        .as_array()
+                                        .and_then(|list| {
+                                            list.iter().find_map(|s| s["rotation"].as_f64())
+                                        })
+                                        .or_else(|| {
+                                            video["tags"]["rotate"]
+                                                .as_str()
+                                                .and_then(|s| s.parse::<f64>().ok())
+                                        })
+                                        .unwrap_or(0.0);
+                                    if ((rotation / 90.0).round() as i32).rem_euclid(2) == 1 {
+                                        std::mem::swap(&mut item.width, &mut item.height);
+                                    }
                                 }
                             }
                         }
@@ -245,7 +302,8 @@ impl Gallery {
                     }
                 }
                 "navigate" => {
-                    if !self.info
+                    if self.editor.is_none()
+                        && !self.info
                         && !self.settings
                         && !self.export_dialog
                         && self.dialog.is_none()
@@ -261,7 +319,12 @@ impl Gallery {
                     }
                 }
                 "error" => self.notice(event["message"].as_str().unwrap_or("Operation failed")),
+                "edit_error" if self.editor.is_none() => {
+                    self.notice(event["message"].as_str().unwrap_or("Photo edit failed"))
+                }
+                "external_copy" => self.notice("Editor copy saved to Pictures/Luma"),
                 "exported" => self.notice("Clip saved to Movies/Luma"),
+                "frame_saved" => self.notice("Frame saved to Pictures/Luma"),
                 "proxy" => {
                     self.proxy = true;
                     self.notice("Playback proxy ready. Exports use the original.");
@@ -355,6 +418,28 @@ impl Gallery {
         }
     }
 
+    fn receive_shared(&mut self, items: Vec<MediaItem>) {
+        if self.editor.is_some() || self.trimming || self.crop_video {
+            self.pending_shared = Some(items);
+        } else {
+            self.open_shared(items);
+        }
+    }
+
+    fn open_shared(&mut self, items: Vec<MediaItem>) {
+        let Some(first) = items.first().cloned() else {
+            return;
+        };
+        self.shared = items;
+        self.pending_shared = None;
+        self.selection.clear();
+        self.dialog = None;
+        self.settings = false;
+        self.menu_open = false;
+        self.export_dialog = false;
+        self.open(first);
+    }
+
     fn open(&mut self, item: MediaItem) {
         #[cfg(target_os = "android")]
         if item.is_video() {
@@ -380,9 +465,21 @@ impl Gallery {
         self.metadata = json!({});
         self.keyframe = None;
         self.proxy = false;
+        self.editor = None;
+        self.video_crop = crate::edit::Crop::default();
+        self.crop_video = false;
+        self.crop_drag = None;
+        self.keep_audio = true;
+        self.waveform = crate::edit::Waveform {
+            status: "Reading audio…".into(),
+            ..Default::default()
+        };
         self.last_rect = None;
         self.center_rail = true;
         bridge::send(json!({"op":"open","item":item}));
+        if item.is_video() {
+            bridge::send(json!({"op":"waveform","item":item}));
+        }
         self.selected = Some(item);
     }
     #[cfg(target_os = "android")]
@@ -396,7 +493,15 @@ impl Gallery {
         }
     }
     fn back(&mut self) {
-        if self.export_dialog {
+        if self.pending_shared.take().is_some() {
+            return;
+        }
+        if let Some(editor) = &mut self.editor {
+            if editor.back() {
+                self.editor = None;
+                self.last_rect = None;
+            }
+        } else if self.export_dialog {
             self.export_dialog = false;
         } else if self.info {
             self.info = false;
@@ -413,6 +518,7 @@ impl Gallery {
         }
     }
     fn close_viewer(&mut self) {
+        self.shared.clear();
         if self.selected.take().is_some() {
             bridge::send(json!({"op":"close"}));
             self.last_rect = None;
@@ -433,6 +539,11 @@ impl Gallery {
                     .contains(&self.query.to_lowercase()))
     }
     fn visible_items(&self) -> Vec<MediaItem> {
+        // Incoming media can be private to the sender and absent from MediaStore.
+        // Keep its order for the rail/swipes without altering library filters.
+        if self.selected.is_some() && !self.shared.is_empty() {
+            return self.shared.clone();
+        }
         let source = if self.view == View::Trash {
             &self.trash
         } else {
@@ -556,8 +667,8 @@ impl Gallery {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("{} items", list.len()))
-                .size(12.0)
-                .color(MUTED),
+                    .size(12.0)
+                    .color(MUTED),
             );
             if self.native["scanning"].as_bool().unwrap_or(false) {
                 ui.spinner();
@@ -902,7 +1013,9 @@ impl Gallery {
     fn drag_scroll(&self, ui: &egui::Ui, pointer: Option<Pos2>) {
         let Some(pointer) = pointer.filter(|p| {
             self.selection.dragging()
-                && self.drag_origin.is_some_and(|origin| origin.distance(*p) > 24.0)
+                && self
+                    .drag_origin
+                    .is_some_and(|origin| origin.distance(*p) > 24.0)
         }) else {
             return;
         };
@@ -974,6 +1087,13 @@ impl Gallery {
                         if action(ui, "edit", "Rename") {
                             self.dialog = Some(Dialog::rename(vec![item.clone()]));
                         }
+                        if !item.is_video() && action(ui, "edit", "Edit photo") {
+                            self.start_editor(item.clone());
+                        }
+                        if !item.is_video() && action(ui, "sparkles", "Open copy in another editor")
+                        {
+                            bridge::send(json!({"op":"photo_external","item":item}));
+                        }
                         if action(ui, "move", "Move to album") {
                             self.dialog = Some(Dialog::target(false, vec![item.clone()]));
                         }
@@ -1004,7 +1124,10 @@ impl Gallery {
                 ui.columns(2, |columns| {
                     let size = columns[0].available_size();
                     self.media_stage(&mut columns[0], &item, size);
-                    self.video_controls(&mut columns[1], &item);
+                    egui::ScrollArea::vertical()
+                        .id_salt("landscape_video_controls")
+                        .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                        .show(&mut columns[1], |ui| self.video_controls(ui, &item));
                 });
             } else {
                 let available = ui.available_size();
@@ -1026,14 +1149,15 @@ impl Gallery {
             return;
         }
         let control_height = if item.is_video() {
-            // Three 40-point control rows and the 62-point timeline, plus row gaps.
-            182.0
+            // Video and audio lanes, playback, trim, and export controls.
+            238.0
                 + ui.spacing().item_spacing.y * 4.0
                 + if self.trimming {
                     40.0 + ui.spacing().item_spacing.y
                 } else {
                     0.0
                 }
+                + if self.crop_video { 72.0 } else { 0.0 }
         } else {
             126.0
         };
@@ -1051,12 +1175,18 @@ impl Gallery {
         }
     }
 
+    fn start_editor(&mut self, item: MediaItem) {
+        bridge::send(json!({"op":"rect","x":0,"y":0,"w":1,"h":1,"visible":false}));
+        self.last_rect = None;
+        self.editor = Some(editor::PhotoEditor::new(item));
+    }
+
     fn photo_controls(&mut self, ui: &mut egui::Ui, item: &MediaItem) {
         ui.horizontal(|ui| {
             let status = self.native["playback"]["photo_status"]
                 .as_str()
                 .unwrap_or("Loading photo");
-            let status_width = (ui.available_width() - 140.0).max(40.0);
+            let status_width = (ui.available_width() - 184.0).max(40.0);
             ui.allocate_ui_with_layout(
                 vec2(status_width, 40.0),
                 egui::Layout::top_down(Align::Min),
@@ -1070,6 +1200,9 @@ impl Gallery {
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if !item.is_trashed() && icons::button(ui, "edit", "Edit photo", false).clicked() {
+                    self.start_editor(item.clone());
+                }
                 if icons::button(ui, "fit", "Fit photo", false).clicked() {
                     bridge::send(json!({"op":"zoom","scale":0}));
                 }
@@ -1183,7 +1316,14 @@ impl Gallery {
     }
 
     fn media_stage(&mut self, ui: &mut egui::Ui, item: &MediaItem, size: Vec2) {
-        let (stage, response) = ui.allocate_exact_size(size, Sense::click());
+        let (stage, response) = ui.allocate_exact_size(
+            size,
+            if self.crop_video {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            },
+        );
         ui.painter().rect_filled(stage, 0, Color32::BLACK);
         #[cfg(target_os = "android")]
         if item.is_video() && self.native["playback"]["uri"] == item.uri {
@@ -1212,7 +1352,19 @@ impl Gallery {
             let fit = (stage.width() / size.x).min(stage.height() / size.y);
             surface.paint(ui, Rect::from_center_size(stage.center(), size * fit));
         }
-        if item.is_video() && response.clicked() {
+        if item.is_video() && self.crop_video {
+            let size = vec2(item.width.max(1) as f32, item.height.max(1) as f32);
+            let fit = (stage.width() / size.x).min(stage.height() / size.y);
+            editor::crop_overlay(
+                ui,
+                Rect::from_center_size(stage.center(), size * fit),
+                &response,
+                &mut self.video_crop,
+                &mut self.crop_drag,
+                !self.export_dialog && !self.info && self.pending_shared.is_none(),
+            );
+        }
+        if item.is_video() && !self.crop_video && response.clicked() {
             bridge::send(json!({"op":"play","playing":!self.playing()}));
         }
         let ppp = ui.ctx().pixels_per_point();
@@ -1225,6 +1377,7 @@ impl Gallery {
                 && !self.settings
                 && !self.export_dialog
                 && self.dialog.is_none()
+                && self.pending_shared.is_none()
                 && !self.menu_open,
         );
         if self.last_rect != Some(rect) {
@@ -1330,11 +1483,25 @@ impl Gallery {
                     self.sync_loop();
                 }
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(timecode(self.timeline.start, true))
-                            .size(12.0)
-                            .color(TRIM),
-                    );
+                    let mut seconds = self.timeline.start as f64 / 1000.0;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut seconds)
+                                .range(0.0..=duration as f64 / 1000.0)
+                                .speed(0.01)
+                                .fixed_decimals(3)
+                                .suffix(" s"),
+                        )
+                        .changed()
+                    {
+                        self.timeline.set_mark(
+                            DragKind::In,
+                            (seconds * 1000.0).round() as i64,
+                            duration,
+                        );
+                        self.keyframe = None;
+                        self.sync_loop();
+                    }
                     ui.small("In");
                 });
                 if icons::button(ui, "out_mark", "Set out point", false).clicked() {
@@ -1343,11 +1510,24 @@ impl Gallery {
                     self.sync_loop();
                 }
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(timecode(self.timeline.end, true))
-                            .size(12.0)
-                            .color(TRIM),
-                    );
+                    let mut seconds = self.timeline.end as f64 / 1000.0;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut seconds)
+                                .range(0.0..=duration as f64 / 1000.0)
+                                .speed(0.01)
+                                .fixed_decimals(3)
+                                .suffix(" s"),
+                        )
+                        .changed()
+                    {
+                        self.timeline.set_mark(
+                            DragKind::Out,
+                            (seconds * 1000.0).round() as i64,
+                            duration,
+                        );
+                        self.sync_loop();
+                    }
                     ui.small("Out");
                 });
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -1362,10 +1542,32 @@ impl Gallery {
                 });
             });
         }
+        if self.crop_video {
+            editor::crop_presets(ui, &mut self.video_crop, item.width, item.height);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.keep_audio, "Keep audio in clip");
+                ui.small("Crop uses Exact cut");
+            });
+        }
         ui.horizontal(|ui| {
             if icons::button(ui, "cut", "Trim video", self.trimming).clicked() {
                 self.trimming = !self.trimming;
+                self.sync_loop();
             }
+            if icons::button(ui, "crop", "Crop video", self.crop_video).clicked() {
+                self.crop_video = !self.crop_video;
+                bridge::send(json!({"op":"play","playing":false}));
+            }
+            let saving_frame = self.native["frame_saving"].as_bool().unwrap_or(false);
+            ui.add_enabled_ui(duration > 0 && !saving_frame, |ui| {
+                if icons::button(ui, "camera", "Save current frame as photo", saving_frame)
+                    .clicked()
+                {
+                    bridge::send(
+                        json!({"op":"capture_frame","uri":item.uri,"time":self.timeline.position}),
+                    );
+                }
+            });
             ui.label(
                 egui::RichText::new(if self.proxy {
                     "Playback proxy".into()
@@ -1388,6 +1590,14 @@ impl Gallery {
                     .clicked()
                 {
                     self.export_dialog = true;
+                    ui.memory_mut(|m| {
+                        if let Some(id) = m.focused() {
+                            m.surrender_focus(id);
+                        }
+                    });
+                    if !self.video_crop.full() {
+                        self.exact = true;
+                    }
                     self.keyframe = None;
                     bridge::send(json!({"op":"keyframe","time":self.timeline.start}));
                     bridge::send(json!({"op":"play","playing":false}));
@@ -1413,8 +1623,15 @@ impl Gallery {
 
     fn draw_timeline(&mut self, ui: &mut egui::Ui, item: &MediaItem, duration: i64) {
         let (rect, response) =
-            ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::click_and_drag());
-        let rail = rect.shrink2(vec2(12.0, 8.0));
+            ui.allocate_exact_size(vec2(ui.available_width(), 118.0), Sense::click_and_drag());
+        let rail = Rect::from_min_size(
+            rect.min + vec2(12.0, 8.0),
+            vec2((rect.width() - 24.0).max(1.0), 46.0),
+        );
+        let audio = Rect::from_min_size(
+            pos2(rail.left(), rail.bottom() + 10.0),
+            vec2(rail.width(), 40.0),
+        );
         let (begin, end) = self.timeline.window(duration);
         let span = (end - begin).max(1);
         for n in 0..8 {
@@ -1426,9 +1643,61 @@ impl Gallery {
             self.cover(ui, item, tile, at, Color32::WHITE);
         }
         let x_for = |time: i64| rail.left() + rail.width() * (time - begin) as f32 / span as f32;
+        ui.painter().rect_filled(audio, 3, PANEL);
+        ui.painter()
+            .hline(audio.x_range(), audio.center().y, Stroke::new(0.5, LINE));
+        for n in 0..=4 {
+            let at = begin + span * n / 4;
+            ui.painter().text(
+                pos2(x_for(at), rect.bottom() - 1.0),
+                if n == 0 {
+                    Align2::LEFT_BOTTOM
+                } else if n == 4 {
+                    Align2::RIGHT_BOTTOM
+                } else {
+                    Align2::CENTER_BOTTOM
+                },
+                timecode(at, span < 10_000),
+                FontId::proportional(9.0),
+                MUTED,
+            );
+        }
+        if self.waveform.peaks.is_empty() {
+            ui.painter().text(
+                audio.center(),
+                Align2::CENTER_CENTER,
+                &self.waveform.status,
+                FontId::proportional(11.0),
+                MUTED,
+            );
+        } else {
+            let columns = (audio.width() / 2.0).ceil().max(1.0) as usize;
+            for n in 0..columns {
+                let from = begin as f64 + span as f64 * n as f64 / columns as f64;
+                let to = begin as f64 + span as f64 * (n + 1) as f64 / columns as f64;
+                let peak = self.waveform.peak(from, to).sqrt() * 17.0;
+                let x = audio.left() + audio.width() * (n as f32 + 0.5) / columns as f32;
+                ui.painter().vline(
+                    x,
+                    audio.center().y - peak..=audio.center().y + peak,
+                    Stroke::new(1.2, if self.keep_audio { TRIM } else { MUTED }),
+                );
+            }
+        }
         if self.trimming {
             let left = x_for(self.timeline.start).clamp(rail.left(), rail.right());
             let right = x_for(self.timeline.end).clamp(rail.left(), rail.right());
+            for r in [
+                Rect::from_min_max(audio.min, pos2(left, audio.bottom())),
+                Rect::from_min_max(pos2(right, audio.top()), audio.max),
+            ] {
+                ui.painter()
+                    .rect_filled(r, 0, Color32::from_black_alpha(180));
+            }
+            for x in [left, right] {
+                ui.painter()
+                    .vline(x, rail.bottom()..=audio.bottom(), Stroke::new(1.0, TRIM));
+            }
             ui.painter().rect_filled(
                 Rect::from_min_max(rail.min, pos2(left, rail.bottom())),
                 0,
@@ -1472,6 +1741,17 @@ impl Gallery {
                     .clamp(0.0, 1.0)
                     .mul_add(span as f32, 0.0) as i64
         };
+        if self.waveform.peaks.is_empty()
+            && self.waveform.status.contains("retry")
+            && response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|p| audio.contains(p))
+        {
+            self.waveform.status = "Reading audio…".into();
+            bridge::send(json!({"op":"waveform","item":item}));
+            return;
+        }
         if response.drag_started() {
             let origin = ui
                 .input(|i| i.pointer.press_origin())
@@ -1524,7 +1804,7 @@ impl Gallery {
                     );
                     let y = (rect.top() - 125.0).max(screen.top());
                     bridge::send(
-                        json!({"op":"preview","time":target,"label":format!("{}  {}x",timecode(target,true),precision),"x":(x*ppp) as i32,"y":(y*ppp) as i32,"w":(width*ppp) as i32,"h":(118.0*ppp) as i32}),
+                        json!({"op":"preview","uri":item.uri,"time":target,"label":format!("{}  {}x",timecode(target,true),precision),"x":(x*ppp) as i32,"y":(y*ppp) as i32,"w":(width*ppp) as i32,"h":(118.0*ppp) as i32}),
                     );
                 }
             }
@@ -1560,11 +1840,31 @@ impl Gallery {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.pending_shared.is_some() {
+            egui::Modal::new(egui::Id::new("incoming_media")).show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                ui.heading("Open shared media?");
+                ui.label("This closes your current editor. Save a copy first to keep your edits.");
+                ui.horizontal(|ui| {
+                    if ui.button("Keep editing").clicked() {
+                        self.pending_shared = None;
+                    }
+                    if ui.button("Open media").clicked()
+                        && let Some(items) = self.pending_shared.take()
+                    {
+                        self.open_shared(items);
+                    }
+                });
+            });
+            return;
+        }
         self.manage_dialog(ctx);
         let width = (ctx.content_rect().width() - 32.0).min(440.0);
         if self.export_dialog {
             egui::Window::new("Export clip").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER,Vec2::ZERO).fixed_size(vec2(width,240.0)).show(ctx,|ui|{
-                ui.horizontal(|ui|{ui.selectable_value(&mut self.exact,false,"Fast / original quality");ui.selectable_value(&mut self.exact,true,"Exact cut");});
+                ui.horizontal(|ui|{ui.add_enabled_ui(self.video_crop.full(),|ui|{ui.selectable_value(&mut self.exact,false,"Fast / original quality");});ui.selectable_value(&mut self.exact,true,"Exact cut");});
+                if !self.video_crop.full() { self.exact=true; ui.small("Crop applied. Video is re-encoded."); }
+                ui.checkbox(&mut self.keep_audio,"Keep audio in clip");
                 ui.add_space(10.0);
                 if self.exact {ui.label("Re-encodes video at the selected frames.");}
                 else {ui.label("Copies video. Start snaps to the preceding keyframe.");}
@@ -1577,7 +1877,7 @@ impl Gallery {
                 ui.horizontal(|ui|{
                     if icons::button(ui,"close","Cancel",false).clicked(){self.export_dialog=false;}
                     if ui.add_enabled(start.is_some(),egui::Button::image_and_text(icons::image("save",ACCENT,20.0),"Save clip").min_size(vec2(160.0,42.0))).clicked(){
-                        bridge::send(json!({"op":"export","start":self.timeline.start,"end":self.timeline.end,"exact":self.exact}));self.export_dialog=false;
+                        bridge::send(json!({"op":"export","start":self.timeline.start,"end":self.timeline.end,"exact":self.exact,"crop":self.video_crop,"audio":self.keep_audio}));self.export_dialog=false;
                     }
                 });
             });
@@ -1599,6 +1899,9 @@ impl Gallery {
                             size_label(item.size)
                         ));
                         if item.is_video() {
+                            if let Some(message) = self.metadata["error"].as_str() {
+                                ui.small(message);
+                            }
                             if let Some(streams) = self.metadata["streams"].as_array() {
                                 for stream in streams.iter().filter(|s| {
                                     s["codec_type"] == "video" || s["codec_type"] == "audio"
@@ -1775,7 +2078,11 @@ fn action_bar(ui: &mut egui::Ui, actions: &[(&'static str, &str, bool)]) -> Opti
         for &(icon, label, enabled) in actions {
             let (rect, response) = ui.allocate_exact_size(
                 vec2(width, ACTION_BAR),
-                if enabled { Sense::click() } else { Sense::hover() },
+                if enabled {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
             );
             let color = if !enabled {
                 MUTED.gamma_multiply(0.45)
@@ -1908,7 +2215,22 @@ impl EguiApp for Gallery {
                         }
                     });
                 }
-                if self.selected.is_some() {
+                if self.editor.is_none() && self.native["photo_saving"] == true {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            self.native["photo_edit_status"]
+                                .as_str()
+                                .unwrap_or("Saving photo"),
+                        );
+                    });
+                }
+                if let Some(editor) = &mut self.editor {
+                    if editor.ui(ui, host, &self.native) {
+                        self.editor = None;
+                        self.last_rect = None;
+                    }
+                } else if self.selected.is_some() {
                     self.viewer(ui);
                 } else {
                     self.library(ui);
@@ -1957,6 +2279,7 @@ impl EguiApp for Gallery {
             };
             egui::Area::new(egui::Id::new("notice"))
                 .order(egui::Order::Foreground)
+                .interactable(!restore.is_empty())
                 .anchor(
                     Align2::CENTER_BOTTOM,
                     vec2(0.0, -safe.bottom - bottom - 8.0),
@@ -2078,6 +2401,74 @@ mod tests {
     }
 
     #[test]
+    fn shared_media_navigates_in_sender_order_outside_library_filters() {
+        let mut gallery = gallery();
+        gallery.query = "no match".into();
+        gallery.oldest = true;
+        gallery.filter = "raw".into();
+        let items: Vec<_> = ["content://sender/one", "content://sender/two"]
+            .into_iter()
+            .map(|uri| MediaItem {
+                uri: uri.into(),
+                name: uri.into(),
+                kind: "photo".into(),
+                ..Default::default()
+            })
+            .collect();
+        gallery.receive_shared(items);
+        gallery.refresh_selected(); // Neither URI is in a library scan.
+        assert_eq!(
+            uris(&gallery),
+            ["content://sender/one", "content://sender/two"]
+        );
+        gallery.neighbor(1);
+        gallery.neighbor(1);
+        assert_eq!(
+            gallery.selected.as_ref().unwrap().uri,
+            "content://sender/two"
+        );
+        gallery.neighbor(-1);
+        assert_eq!(
+            gallery.selected.as_ref().unwrap().uri,
+            "content://sender/one"
+        );
+        gallery.close_viewer();
+        assert!(gallery.shared.is_empty());
+        assert_eq!(gallery.query, "no match");
+        assert!(uris(&gallery).is_empty());
+    }
+
+    #[test]
+    fn new_share_does_not_discard_an_open_editor() {
+        let mut gallery = gallery();
+        gallery.open(gallery.items[0].clone());
+        gallery.editor = Some(editor::PhotoEditor::new(gallery.items[0].clone()));
+        gallery.receive_shared(vec![gallery.items[1].clone()]);
+        assert_eq!(gallery.selected.as_ref().unwrap().uri, "new");
+        assert!(gallery.editor.is_some() && gallery.pending_shared.is_some());
+        gallery.back(); // Dismiss the incoming confirmation, preserving the edit.
+        assert!(gallery.editor.is_some() && gallery.pending_shared.is_none());
+        gallery.receive_shared(vec![gallery.items[1].clone()]);
+        let items = gallery.pending_shared.take().unwrap();
+        gallery.open_shared(items);
+        assert!(gallery.editor.is_none());
+        assert_eq!(gallery.selected.as_ref().unwrap().uri, "middle");
+    }
+
+    #[test]
+    fn new_share_preserves_a_video_trim_until_accepted() {
+        let mut gallery = gallery();
+        gallery.open(gallery.items[0].clone());
+        gallery.trimming = true;
+        gallery.timeline.start = 2000;
+        gallery.timeline.end = 6000;
+        gallery.receive_shared(vec![gallery.items[1].clone()]);
+        assert!(gallery.pending_shared.is_some());
+        assert_eq!((gallery.timeline.start, gallery.timeline.end), (2000, 6000));
+        assert_eq!(gallery.selected.as_ref().unwrap().uri, "new");
+    }
+
+    #[test]
     fn virtual_grid_rows_keep_their_position_across_scroll_boundaries() {
         for view in [View::Albums, View::All] {
             for size in [vec2(411.0, 891.0), vec2(891.0, 411.0)] {
@@ -2178,7 +2569,9 @@ mod tests {
             force: None,
         }];
         match phase {
-            egui::TouchPhase::Start => events.extend([egui::Event::PointerMoved(pos), button(true)]),
+            egui::TouchPhase::Start => {
+                events.extend([egui::Event::PointerMoved(pos), button(true)])
+            }
             egui::TouchPhase::Move => events.push(egui::Event::PointerMoved(pos)),
             _ => events.extend([button(false), egui::Event::PointerGone]),
         }
@@ -2209,7 +2602,8 @@ mod tests {
             .iter()
             .filter_map(|shape| match &shape.shape {
                 egui::Shape::Rect(rect)
-                    if rect.fill == PANEL && (rect.rect.width() - rect.rect.height()).abs() < 1.0 =>
+                    if rect.fill == PANEL
+                        && (rect.rect.width() - rect.rect.height()).abs() < 1.0 =>
                 {
                     Some(rect.rect)
                 }
@@ -2218,7 +2612,12 @@ mod tests {
             .collect();
         let side = tiles.iter().map(|r| r.width()).fold(0.0, f32::max);
         tiles.retain(|r| r.width() > 60.0 && (r.width() - side).abs() < 1.0);
-        tiles.sort_by(|a, b| a.min.y.total_cmp(&b.min.y).then(a.min.x.total_cmp(&b.min.x)));
+        tiles.sort_by(|a, b| {
+            a.min
+                .y
+                .total_cmp(&b.min.y)
+                .then(a.min.x.total_cmp(&b.min.x))
+        });
         tiles
     }
 
@@ -2312,21 +2711,29 @@ mod tests {
         assert!(gallery.favorites.contains(&uri("middle")));
         gallery.managed(&json!({"action":"move","done":1,"target":"Pictures/Trips",
             "uris":[uri("middle")],"renamed":{uri("middle"): uri("99")}}));
-        assert!(gallery.favorites.contains(&uri("99")) && !gallery.favorites.contains(&uri("middle")));
+        assert!(
+            gallery.favorites.contains(&uri("99")) && !gallery.favorites.contains(&uri("middle"))
+        );
         assert_eq!(gallery.toast.as_ref().unwrap().0, "Moved 1 item to Trips");
         gallery.managed(&json!({"action":"delete","done":1,"uris":[uri("99")]}));
         assert!(gallery.favorites.is_empty());
         gallery.managed(&json!({"action":"rename","failed":2,"error":"a.jpg: denied"}));
-        assert_eq!(gallery.toast.as_ref().unwrap().0, "Could not rename: a.jpg: denied");
-        gallery.managed(&json!({"action":"copy","done":2,"failed":1,"cancelled":true,
-            "target":"DCIM/Keep","error":"b.jpg: full"}));
+        assert_eq!(
+            gallery.toast.as_ref().unwrap().0,
+            "Could not rename: a.jpg: denied"
+        );
+        gallery.managed(
+            &json!({"action":"copy","done":2,"failed":1,"cancelled":true,
+            "target":"DCIM/Keep","error":"b.jpg: full"}),
+        );
         assert_eq!(
             gallery.toast.as_ref().unwrap().0,
             "Copied 2 items to Keep; the rest was cancelled. 1 item failed: b.jpg: full"
         );
         gallery.managed(&json!({"action":"restore","done":0,"cancelled":true}));
         assert_eq!(gallery.toast.as_ref().unwrap().0, "Cancelled");
-        gallery.items[3].uri = "content://com.android.externalstorage.documents/tree/a/document/b".into();
+        gallery.items[3].uri =
+            "content://com.android.externalstorage.documents/tree/a/document/b".into();
         let linked = gallery.items[3].uri.clone();
         gallery.managed(&json!({"action":"trash","done":2,"uris":[uri("new"), linked]}));
         let (text, _, undo) = gallery.toast.clone().unwrap();
@@ -2348,20 +2755,33 @@ mod tests {
             item.uri = format!("content://media/external/images/media/{}", item.uri);
         }
         gallery.delete(items.clone());
-        assert!(gallery.dialog.is_none(), "Trash moves are confirmed by Android");
+        assert!(
+            gallery.dialog.is_none(),
+            "Trash moves are confirmed by Android"
+        );
         let mut linked = items.clone();
         linked[0].uri = "content://com.android.externalstorage.documents/tree/x/document/y".into();
         gallery.delete(linked);
-        assert!(matches!(&gallery.dialog, Some(Dialog::Delete { action: "trash", detail, .. })
-            if detail.starts_with("1 item from linked folders")));
+        assert!(
+            matches!(&gallery.dialog, Some(Dialog::Delete { action: "trash", detail, .. })
+            if detail.starts_with("1 item from linked folders"))
+        );
         items[0].expires = 1;
         gallery.delete(items.clone());
-        assert!(matches!(&gallery.dialog, Some(Dialog::Delete { action: "delete", title, .. })
-            if title == "Delete forever?"));
+        assert!(
+            matches!(&gallery.dialog, Some(Dialog::Delete { action: "delete", title, .. })
+            if title == "Delete forever?")
+        );
         gallery.native = json!({"sdk": 29});
         items[0].expires = 0;
         gallery.delete(items);
-        assert!(matches!(&gallery.dialog, Some(Dialog::Delete { action: "delete", .. })));
+        assert!(matches!(
+            &gallery.dialog,
+            Some(Dialog::Delete {
+                action: "delete",
+                ..
+            })
+        ));
         gallery.back();
         assert!(gallery.dialog.is_none());
     }

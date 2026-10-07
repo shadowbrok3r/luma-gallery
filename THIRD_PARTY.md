@@ -16,7 +16,7 @@ The launcher and toolbar SVGs are original project assets.
 | LibVLC Android | 3.7.7, 0b8dc65e | LGPL-2.1-or-later | https://code.videolan.org/videolan/libvlcjni |
 | VLC core | 84177b22 plus LibVLC build patches | LGPL configuration | https://code.videolan.org/videolan/vlc |
 | Android C++ runtime | NDK distribution | Apache-2.0 with LLVM exception | https://android.googlesource.com/platform/ndk |
-| EguiMobile | 0.1.4, 31d1cbeb | MIT or Apache-2.0 | https://github.com/shadowbrok3r/EguiMobile |
+| EguiMobile | 0.1.4, 31d1cbeb; Android IME fixes through ad77e546 plus local toolbar layout patch | MIT or Apache-2.0 | https://github.com/shadowbrok3r/EguiMobile; `vendor/egui-android/UPSTREAM` |
 | egui and egui_extras | 0.36 | MIT or Apache-2.0 | https://github.com/emilk/egui |
 
 `Cargo.lock` records all Rust dependencies. `scripts/prepare-native.sh` records native versions,
@@ -28,7 +28,8 @@ native bridge, build scripts, and FFmpeg, x264, LibRaw, LibVLC JNI, VLC core, DN
 libjxl and libjpeg sources,
 including their license texts. The LibVLC build scripts record the core revision, patches,
 and contrib recipes. NDK and toolchain notices are included as well.
-Rust source dependencies are pinned to public Cargo/git sources.
+Rust source dependencies are pinned to public Cargo/git sources, except the patched
+Android backend included in `vendor/egui-android` and the release source archive.
 The unmodified LibVLC AAR is available from Maven Central at
 https://repo.maven.apache.org/maven2/org/videolan/android/libvlc-all/3.7.7/ .
 
