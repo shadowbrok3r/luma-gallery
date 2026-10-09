@@ -10,7 +10,7 @@ repository = "https://github.com/shadowbrok3r/EguiMobile"
 
 [dependencies]
 egui = "0.36"
-egui-mobile-core = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "31d1cbebead2ea9c52e50e4b6602c2b1f90c6abd" }
+egui-mobile-core = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "8098d9d3460a425a68b34731271ed6fc643025fc" }
 # BOTH renderers are compiled and the choice is made at RUNTIME, never by a cargo feature: a
 # workspace-wide check unifies features, and a cfg-based choice would then build one egui-android
 # rlib with glow selected — silently blanking comfyui and every plugin viewport. `wgpu` must stay
@@ -33,7 +33,7 @@ ndk-context = "0.1"
 log = "0.4"
 android_logger = "0.15"
 # WASM plugin runtime (feature `plugins`), shared with iOS. Pulley interpreter on Android too.
-egui-ios-plugin-host = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "31d1cbebead2ea9c52e50e4b6602c2b1f90c6abd", optional = true }
+egui-ios-plugin-host = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "8098d9d3460a425a68b34731271ed6fc643025fc", optional = true }
 postcard = { version = "1", features = ["use-std"], optional = true }
 
 [features]
