@@ -23,9 +23,6 @@ jni = "0.21"
 [patch.crates-io]
 android-activity = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "8098d9d3460a425a68b34731271ed6fc643025fc" }
 
-[patch."https://github.com/shadowbrok3r/EguiMobile"]
-egui-android = { path = "vendor/egui-android" }
-
 [profile.release]
 lto = "thin"
 strip = "debuginfo"

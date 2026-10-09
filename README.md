@@ -62,8 +62,8 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
 Requires Rust, cargo-egui-mobile/cargo-apk2, Android SDK/NDK r28, Java 17, curl, unzip, make,
 pkg-config, NASM, CMake, Ninja, patch, jq and librsvg's `rsvg-convert`.
 Native source versions and checksums are pinned; see `THIRD_PARTY.md` for the SDK's separate license.
-The Android backend is vendored under `vendor/egui-android` to retain the subclass keyboard
-bridge, Enter-dismissal and text-toolbar layout fixes; revisions are recorded in `UPSTREAM`.
+The Android backend is EguiMobile's `egui-android` at the revision `Cargo.toml` pins, which
+carries the subclass keyboard bridge, Enter dismissal and the composing-word fix.
 The toolbar has its own space above the keyboard, leaving prompt text unobstructed.
 
 ```sh

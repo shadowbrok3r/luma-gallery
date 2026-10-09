@@ -584,6 +584,7 @@ dependencies = [
 [[package]]
 name = "egui-android"
 version = "0.1.4"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
 dependencies = [
  "android-activity",
  "android_logger",

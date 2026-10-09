@@ -1,5 +1,21 @@
 # Verification
 
+## EguiMobile Backend (2026-10-09)
+
+Luma builds EguiMobile's `egui-android` at the pinned revision (`8098d9d3`) again, instead of
+the copy kept under `vendor/egui-android`. The copy existed because the subclass IME bridge and
+single-line Enter dismissal had not been pushed to EguiMobile. They are on its master now, with
+the text-toolbar strip and the composing-word fix that 0.1.12 ported into the copy by hand, so
+later EguiMobile fixes reach Luma through the pin alone. The toolbar widget's host tests are
+EguiMobile's `tests/text-actions`; the duplicate `scripts/text-actions-tests` went with the
+copy, and the release source archive no longer has a `vendor` directory.
+
+- All 30 library tests pass, and `cargo ndk -t arm64-v8a check` builds `egui-android` from the
+  pinned revision.
+- On the existing `s26ultra` AVD (emulator build), EguiMobile's `tests/compose-ime` keyboard held
+  `hello` composing in album search; a held tap on the item count outside the field left
+  `hello` in the field.
+
 ## Video Frames Release 0.1.11 (2026-10-07)
 
 The old scrub worker invalidated every decode whenever another time request arrived,
