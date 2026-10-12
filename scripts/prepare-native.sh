@@ -67,7 +67,7 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                 make install-lib-static
             )
         fi
-        if [ ! -f ".build/$archabi/ffmpeg-editor-v1-ready" ]; then
+        if [ ! -f ".build/$archabi/ffmpeg-studio-v1-ready" ]; then
             (
                 cd ".build/$archabi/ffmpeg"
                 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
@@ -83,13 +83,13 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                     --enable-decoder=h264,hevc,aac,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32le,mjpeg,png,ppm,rawvideo,flac,mp3,opus,vorbis,vp8,vp9,av1 \
                     --enable-encoder=libx264,aac,mjpeg,png,pcm_s16le --enable-parser=h264,hevc,aac,mjpeg,vp8,vp9,av1 \
                     --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
-                    --enable-filter=scale,format,fps,trim,atrim,setpts,asetpts,aresample,aformat,null,anull,transpose,rotate,crop,volume,astats,ametadata,asetnsamples \
+                    --enable-filter=scale,format,fps,trim,atrim,setpts,asetpts,aresample,aformat,null,anull,transpose,rotate,crop,volume,astats,ametadata,asetnsamples,overlay,fade,afade,concat,split,asplit,hflip,vflip,pad,color,loop,setsar,tpad,boxblur,xfade,acrossfade,amix,adelay,atempo,apad,anullsrc \
                     --extra-cflags="-I$prefix/include -O3" \
                     --extra-ldflags="-L$prefix/lib -pie -Wl,-z,max-page-size=16384"
                 make -j"$jobs"
                 cp ffmpeg "$root/native/libs/$archabi/libffmpeg_exec.so"
                 cp ffprobe "$root/native/libs/$archabi/libffprobe_exec.so"
-                touch "$root/.build/$archabi/ffmpeg-editor-v1-ready"
+                touch "$root/.build/$archabi/ffmpeg-studio-v1-ready"
             )
         fi
         if [ ! -f "$prefix/lib/libraw.a" ]; then

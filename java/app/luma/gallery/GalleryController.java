@@ -76,6 +76,8 @@ final class GalleryController {
     private int videoWidth, videoHeight, stageX, stageY, stageWidth, stageHeight;
     private boolean stageVisible = true, muted, loop;
     private long loopStart, loopEnd;
+    private long[] rangeIn = new long[0], rangeOut = new long[0];
+    private long clockTime = -1, clockAt, jumpTarget = -1, jumpAt;
     private float speed = 1;
     private boolean software;
     private String photoStatus = "", playbackError = "";
@@ -125,7 +127,32 @@ final class GalleryController {
                 if (selected != null) state.put("uri", selected.optString("uri"));
             } catch (Exception ignored) { }
             playback = state;
-            main.postDelayed(this, 100);
+            main.postDelayed(this, player != null && player.isPlaying() ? 33 : 100);
+        }
+    };
+
+    /** Plays only the edit's source ranges, extrapolating LibVLC's coarse clock between updates. */
+    private final Runnable rangeWatch = new Runnable() {
+        @Override public void run() {
+            if (closed || rangeIn.length == 0) return;
+            if (player != null && player.isPlaying()) {
+                long time = player.getTime(), now = SystemClock.uptimeMillis();
+                boolean settling = now - jumpAt < 600 && time < jumpTarget - 100;
+                if (time != clockTime) { clockTime = time; clockAt = now; }
+                long at = clockTime + (long)(Math.min(400, now - clockAt) * speed);
+                int i = 0;
+                while (i < rangeIn.length && at >= rangeOut[i] - 25) i++;
+                if (settling) { }
+                else if (i >= rangeIn.length) {
+                    player.pause();
+                    player.setTime(Math.max(rangeIn[rangeIn.length - 1], rangeOut[rangeOut.length - 1] - 40), false);
+                    clockTime = -1;
+                } else if (at < rangeIn[i] - 60) {
+                    player.setTime(rangeIn[i], false);
+                    jumpTarget = rangeIn[i]; jumpAt = now; clockTime = rangeIn[i]; clockAt = now;
+                }
+            } else clockTime = -1;
+            main.postDelayed(this, 15);
         }
     };
 
@@ -170,7 +197,9 @@ final class GalleryController {
                             stageX = data.getInt("x"); stageY = data.getInt("y"); stageWidth = data.getInt("w"); stageHeight = data.getInt("h");
                             stageVisible = data.optBoolean("visible", true); layoutStage(); break;
                         case "play": togglePlay(data.optBoolean("playing", true)); break;
-                        case "seek": if (player != null) player.setTime(Math.max(0, data.getLong("time")), false); break;
+                        case "seek": if (player != null) player.setTime(Math.max(0, data.getLong("time")), data.optBoolean("fast", false)); break;
+                        case "segments": ranges(data.optJSONArray("ranges")); break;
+                        case "studio_export": studioExport(data); break;
                         case "mute": muted = data.getBoolean("muted"); if (player != null) player.setVolume(muted ? 0 : 100); break;
                         case "rate": speed = (float)data.getDouble("rate"); if (player != null) player.setRate(speed); break;
                         case "loop": loop = data.getBoolean("enabled"); loopStart = data.optLong("start"); loopEnd = data.optLong("end"); break;
@@ -512,6 +541,7 @@ final class GalleryController {
         if (photo != null) { photo.close(); photo = null; }
         if (source != null) try { source.close(); } catch (Exception ignored) { }
         source = null; selected = null; loop = false; playbackError = ""; photoStatus = "";
+        rangeIn = new long[0]; rangeOut = new long[0]; main.removeCallbacks(rangeWatch);
         audio.abandonAudioFocusRequest(focus);
         activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
@@ -593,6 +623,15 @@ final class GalleryController {
         });
     }
 
+    private void ranges(JSONArray ranges) throws JSONException {
+        int count = ranges == null ? 0 : ranges.length();
+        long[] in = new long[count], out = new long[count];
+        for (int i = 0; i < count; i++) { in[i] = ranges.getJSONArray(i).getLong(0); out[i] = ranges.getJSONArray(i).getLong(1); }
+        rangeIn = in; rangeOut = out; clockTime = -1;
+        main.removeCallbacks(rangeWatch);
+        if (count > 0) main.post(rangeWatch);
+    }
+
     private void locateKeyframe(JSONObject request) {
         JSONObject item = selected;
         if (item == null) return;
@@ -619,7 +658,6 @@ final class GalleryController {
         pause();
         exports.execute(() -> {
             File output = null;
-            Uri pendingUri = null;
             try (MediaFiles.Source src = files.source(item.getString("uri"))) {
                 MediaFiles.CutPoint cut = exact || proxy
                     ? new MediaFiles.CutPoint(requestedStart * 1000, requestedStart * 1000)
@@ -669,20 +707,7 @@ final class GalleryController {
                     exportStatus="Playback proxy ready";
                 } else {
                     String base = item.optString("name","clip").replaceFirst("\\.[^.]+$", "");
-                    String name = base + "_clip_" + System.currentTimeMillis() + ".mp4";
-                    ContentValues values = new ContentValues();
-                    values.put(MediaStore.MediaColumns.DISPLAY_NAME,name); values.put(MediaStore.MediaColumns.MIME_TYPE,"video/mp4");
-                    values.put(MediaStore.MediaColumns.RELATIVE_PATH,"Movies/Luma"); values.put(MediaStore.MediaColumns.IS_PENDING,1);
-                    pendingUri = activity.getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,values);
-                    if (pendingUri == null) throw new IOException("Could not create the exported clip");
-                    try (InputStream input = new FileInputStream(output); OutputStream target = activity.getContentResolver().openOutputStream(pendingUri)) {
-                        if (target == null) throw new IOException("Export destination is unavailable");
-                        byte[] buffer = new byte[1024*1024]; int count;
-                        while ((count=input.read(buffer))!=-1) { if(exportCancelled.get()) throw new InterruptedException("Export cancelled"); target.write(buffer,0,count); }
-                    }
-                    values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING,0);
-                    activity.getContentResolver().update(pendingUri,values,null,null);
-                    exportUri=pendingUri.toString(); pendingUri=null;
+                    exportUri = publish(output, base + "_clip_" + System.currentTimeMillis() + ".mp4").toString();
                     exportStatus="Saved to Movies/Luma";
                     emit(new JSONObject().put("type","exported").put("uri",exportUri).put("start",start).put("end",requestedEnd).put("exact",exact));
                     scan();
@@ -692,9 +717,73 @@ final class GalleryController {
                 exportStatus=exportCancelled.get() ? "Export cancelled" : "Export failed";
                 if(!exportCancelled.get()) error("Export: "+e.getMessage());
             } finally {
-                if (pendingUri!=null) activity.getContentResolver().delete(pendingUri,null,null);
                 if (output!=null) output.delete();
                 exporting=false;
+                files.pruneCache(Collections.emptySet());
+            }
+        });
+    }
+
+    /** Copies a finished render into Movies/Luma; a failed copy leaves no pending entry. */
+    private Uri publish(File output, String name) throws Exception {
+        ContentResolver resolver = activity.getContentResolver();
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME,name); values.put(MediaStore.MediaColumns.MIME_TYPE,"video/mp4");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH,"Movies/Luma"); values.put(MediaStore.MediaColumns.IS_PENDING,1);
+        Uri pending = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,values);
+        if (pending == null) throw new IOException("Could not create the exported clip");
+        try {
+            try (InputStream input = new FileInputStream(output); OutputStream target = resolver.openOutputStream(pending)) {
+                if (target == null) throw new IOException("Export destination is unavailable");
+                byte[] buffer = new byte[1024*1024]; int count;
+                while ((count=input.read(buffer))!=-1) { if(exportCancelled.get()) throw new InterruptedException("Export cancelled"); target.write(buffer,0,count); }
+            }
+            values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING,0);
+            resolver.update(pending,values,null,null);
+            return pending;
+        } catch (Exception e) {
+            resolver.delete(pending,null,null);
+            throw e;
+        }
+    }
+
+    /** Runs the editor's FFmpeg arguments against the open video and publishes the result. */
+    private void studioExport(JSONObject request) throws Exception {
+        if (exporting) { error("Wait for the current export to finish"); return; }
+        final JSONObject item = selected;
+        if (item == null || !item.optString("uri").equals(request.optString("uri"))) { error("Open the video before exporting"); return; }
+        final JSONArray args = request.getJSONArray("args");
+        final long lengthUs = Math.max(1, request.optLong("duration")) * 1000;
+        exporting = true; exportProgress = 0; exportStatus = "Rendering video"; exportUri = "";
+        exportCancelled.set(false);
+        pause();
+        exports.execute(() -> {
+            File output = null;
+            try (MediaFiles.Source src = files.source(item.getString("uri"))) {
+                output = new File(activity.getCacheDir(), "studio-" + System.currentTimeMillis() + ".mp4");
+                List<String> command = new ArrayList<>();
+                for (int i = 0; i < args.length(); i++) {
+                    String arg = args.getString(i);
+                    command.add("{source}".equals(arg) ? src.path : "{output}".equals(arg) ? output.getAbsolutePath() : arg);
+                }
+                files.run("ffmpeg", command, 7200, exportProcess, line -> {
+                    if (exportCancelled.get()) { Process process=exportProcess.get(); if (process!=null) process.destroyForcibly(); }
+                    if (line.startsWith("out_time_us=")) try { exportProgress=Math.min(0.99,Long.parseLong(line.substring(12))/(double)lengthUs); } catch (Exception ignored) { }
+                });
+                if (exportCancelled.get()) throw new InterruptedException("Export cancelled");
+                if (output.length() < 100) throw new IOException("Export produced no media");
+                String base = item.optString("name","video").replaceFirst("\\.[^.]+$", "");
+                exportUri = publish(output, base + "_edit_" + System.currentTimeMillis() + ".mp4").toString();
+                exportStatus = "Saved to Movies/Luma";
+                emit(new JSONObject().put("type","exported").put("uri",exportUri).put("studio",true));
+                scan();
+                exportProgress = 1;
+            } catch (Exception e) {
+                exportStatus = exportCancelled.get() ? "Export cancelled" : "Export failed";
+                if (!exportCancelled.get()) error("Export: " + e.getMessage());
+            } finally {
+                if (output != null) output.delete();
+                exporting = false;
                 files.pruneCache(Collections.emptySet());
             }
         });
@@ -745,7 +834,7 @@ final class GalleryController {
 
     void close() {
         edits.close(); qwen.close(); waveform.close(); frames.close();
-        closed=true; main.removeCallbacks(tick); closeMedia();
+        closed=true; main.removeCallbacks(tick); main.removeCallbacks(rangeWatch); closeMedia();
         Process process=exportProcess.get(); if(process!=null) process.destroyForcibly();
         CompletableFuture<Boolean> answer=consent; if(answer!=null) answer.complete(false);
         manager.cancelled.set(true);

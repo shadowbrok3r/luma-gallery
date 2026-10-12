@@ -1,5 +1,51 @@
 # Verification
 
+## Video Editor Release 0.1.13 (2026-10-12)
+
+The editor keeps one project per source video (URI and size; "Open with" files get a new
+modification time on every open). The project is plain data in `src/studio.rs`; preview and
+export share `src/caption.rs`, which shapes text with harfrust, falls back per character across
+system and bundled fonts, and draws outlines, boxes, shadows, bitmap emoji and photos with
+tiny-skia. `src/compose.rs` turns the project into one FFmpeg command: `trim`/`concat` cuts,
+segment `fade`/`afade`, crop/scale, then looped PNG overlays with alpha fades and slide
+expressions matching `Clip::envelope`. The bundled FFmpeg 8.0.1 build adds `overlay`, `fade`,
+`afade`, `concat`, `split`/`asplit`, `xfade`, `pad` and related filters (marker
+`ffmpeg-studio-v1-ready`); both ABIs contain them.
+
+- 60 host tests pass: the project model (split/ripple/trim/snap/undo/serde), the rasterizer
+  (wrapping, outline, box, shadow, Noto Emoji and Noto Color Emoji fallbacks, font scanning,
+  rotation), the FFmpeg graph, and editor interactions driven through egui touch events
+  (dragging and center-snapping a caption, trimming a clip handle, hiding a layer, mapping the
+  player position through removed parts, restoring a saved project).
+- `compose::tests::desktop_ffmpeg_renders_cuts_fades_and_captions` runs the generated command
+  with the host's FFmpeg 9.0.1: a removed 3-5 s range, a fade from black, a 1:1 crop and a
+  caption that appears only between 1.0 and 2.5 s, checked by pixel.
+- On the existing `s26ultra` AVD (Android 16, x86_64, 1440 x 3120, density 560), explored with
+  ARTEMIS and ADB: captions with presets, fonts, styles and animations; stage drag, center snap,
+  corner scale/rotate; timeline trim handles; split and ripple delete; fades and dips previewed
+  on the stage; photo overlay layers; layer visibility, locks and order; autosave after a
+  force-stop; the debug panel. Two on-device exports matched the preview frame by frame
+  (fade-in, dip on both sides of a cut, a rotated rounded photo, removed 2.63 s).
+- On the AVD, fast swipes lost their final 60-160 ms of movement: egui-winit releases the button
+  at the last delivered move and only `Touch { End }` carries the lift point. Editor drags now
+  finish at that point; `drags_end_at_the_touch_lift_point` reproduces egui-winit's sequence.
+- `scripts/smoke-studio.py` passed all 7 checks: scrub to start, splits at 4.000 and 6.000 s with
+  the middle deleted, an 8.00 s export with audio, OCR of the burned-in caption, its end after
+  3 s, frames after the cut matching the source at 6.50 s, and the unchanged original.
+- `smoke-export.py` still passes with C0038 after the MediaStore publishing refactor: the fast
+  cut starts at the 3.570 s keyframe with 117 byte-identical packets; the exact cut keeps 4K/AAC.
+- The AVD's system emoji font is COLRv1-only, so emoji there use monochrome Noto Emoji; color
+  emoji were checked on the host with a CBDT font. Physical-phone behavior, Samsung fonts and
+  HDR sources are not covered.
+
+Evidence: `evidence/studio-smoke/` and `evidence/export-studio/`.
+
+```sh
+cargo test --lib
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-studio.py --serial emulator-5554
+LUMA_SHEET=presets.png cargo test --lib preset_sheet -- --ignored
+```
+
 ## EguiMobile Backend (2026-10-09)
 
 Luma builds EguiMobile's `egui-android` at the pinned revision (`8098d9d3`) again, instead of

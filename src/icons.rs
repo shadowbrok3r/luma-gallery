@@ -54,7 +54,18 @@ pub fn source(name: &str) -> &'static [u8] {
         "eraser",
         "undo",
         "sparkles",
-        "waveform"
+        "waveform",
+        "text",
+        "layers",
+        "eye",
+        "eye_off",
+        "lock",
+        "unlock",
+        "redo",
+        "fade",
+        "align_left",
+        "align_center",
+        "align_right"
     )
 }
 

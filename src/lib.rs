@@ -1,9 +1,12 @@
 mod app;
 mod bridge;
+mod caption;
+mod compose;
 mod edit;
 mod icons;
 mod mask;
 mod model;
+mod studio;
 
 use egui::Color32;
 const BG: Color32 = Color32::BLACK;

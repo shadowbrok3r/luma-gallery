@@ -31,6 +31,21 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
 - Video editing: numeric in/out seconds, draggable trim handles, crop presets and a separate
   audio waveform aligned with the frame strip, playhead and timeline zoom. Crop uses Exact
   cut; exports can retain or omit audio. These tools also work on non-Sony recordings.
+- **Edit video** (pencil in the viewer, or the More menu) opens a multi-layer editor. The video
+  track splits at the playhead; deleting a part ripples later captions with it. Segments fade in
+  and out through black or white, and a cut can dip to black. Playback skips removed parts.
+- Captions sit on text layers and photos on overlay layers, drawn as translucent clip boxes
+  in each layer's color; colored bands on the video track show where layers overlap it. Drag a
+  caption on the video (it snaps to the center lines), resize/rotate with its corner handle or
+  two fingers, and trim or move clips with timeline handles that snap to the playhead and edges.
+  Layers can be hidden (also left out of exports), locked, renamed, recolored and reordered.
+- Text styles: device fonts (Roboto, Noto Serif, Source Sans Pro, Dancing Script, ...), size,
+  bold/italic/underline/caps, alignment, colors, outline, rounded box with opacity, drop shadow
+  or glow, spacing and wrap width, plus presets (Classic, Subtitle, Glass, Yellow, Neon, ...).
+  Captions and overlays fade or slide in and out. Canvas crop, audio volume/fades, undo/redo and
+  per-video autosave are included; Debug shows mapping, render timing, JSON and the FFmpeg command.
+- Exports render every caption with the same rasterizer as the preview, then FFmpeg composes
+  cuts, fades, crop and overlays into a new H.264/AAC file under `Movies/Luma`.
 - The camera button beside video crop saves the selected frame as a full-resolution PNG
   under `Pictures/Luma`. It pauses playback and uses the original video, including rotation,
   without the app controls or pending clip crop. Scrub previews follow the current video;
@@ -90,6 +105,9 @@ This probe is test tooling only and is not included in the application's classes
 The fixture layout and OCR prerequisites are listed in `VERIFICATION.md`.
 Crop gesture regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-crop.py --serial emulator-5554`.
 Checks that moving/resizing survives release and that photo/video copies use the selected bounds.
+Video editor regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-studio.py --serial emulator-5554`.
+Adds a caption, splits twice, deletes the middle part and exports; checks duration, audio, the
+burned-in caption (OCR) and the cut against the source.
 Video frame regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-video-frames.py --serial emulator-5554 --evidence evidence/video-frames`.
 Checks moving previews across warm video switches, silent WebM, full-resolution PNG frames,
 rotation, Android metadata fallback and unchanged originals against generated video fixtures.
@@ -121,6 +139,12 @@ not used for conventional video decoding. This build composites SDR; HDR passthr
 HDR-to-SDR tone mapping are not implemented. Frame stepping uses the reported average rate;
 variable-frame-rate footage is not guaranteed frame-index exact. Fast-cut boundaries can
 include extra codec reorder frames; use Exact cut for tighter boundaries.
+
+The video editor edits one source video per project; it does not join other videos or place
+video picture-in-picture. Its preview applies cuts, fades and overlays live, but volume and audio
+fades are heard only in the export. Color emoji render from bitmap (CBDT/sbix) emoji fonts;
+COLRv1-only emoji fonts, such as the Android 16 emulator's, fall back to monochrome Noto Emoji.
+Editor exports re-encode with x264 and use the cropped source size or a 1080p/720p limit.
 
 Full RAW development and exact export are CPU jobs and can take time. Keep the app open while
 exporting; background job recovery is not implemented. The displayed RAW JPEG is not lossless,

@@ -19,6 +19,10 @@ The launcher and toolbar SVGs are original project assets.
 | EguiMobile | 0.1.4, 8098d9d3 | MIT or Apache-2.0 | https://github.com/shadowbrok3r/EguiMobile |
 | egui and egui_extras | 0.36 | MIT or Apache-2.0 | https://github.com/emilk/egui |
 
+Captions are rasterized with skrifa, harfrust and tiny-skia (MIT or Apache-2.0 / MIT /
+BSD-3-Clause) from the device's system fonts or the fonts egui already bundles (Ubuntu Light
+under the Ubuntu Font Licence 1.0, Hack under MIT/Bitstream Vera, Noto Emoji under OFL-1.1),
+and are burned into exported videos as images.
 `Cargo.lock` records all Rust dependencies. `scripts/prepare-native.sh` records native versions,
 checksums, configuration, and toolchain. FFmpeg, LibRaw, and DNG conversion execute in separate processes;
 LibVLC and the shared C++ runtime are dynamically linked and unmodified.

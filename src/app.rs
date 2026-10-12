@@ -1,5 +1,6 @@
 mod editor;
 mod manage;
+mod studio;
 
 use crate::{ACCENT, BG, LINE, MUTED, PANEL, TEXT, TRIM, bridge, icons, model::*};
 use egui::{
@@ -64,6 +65,7 @@ pub struct Gallery {
     last_preview: Instant,
     proxy: bool,
     editor: Option<editor::PhotoEditor>,
+    studio: Option<studio::Studio>,
     video_crop: crate::edit::Crop,
     crop_video: bool,
     crop_drag: Option<editor::CropDrag>,
@@ -120,6 +122,7 @@ impl Gallery {
             last_preview: Instant::now() - Duration::from_secs(1),
             proxy: false,
             editor: None,
+            studio: None,
             video_crop: crate::edit::Crop::default(),
             crop_video: false,
             crop_drag: None,
@@ -158,6 +161,9 @@ impl Gallery {
         for event in events {
             if let Some(editor) = &mut self.editor {
                 editor.event(ctx, &event);
+            }
+            if let Some(studio) = &mut self.studio {
+                studio.event(&event);
             }
             match event["type"].as_str().unwrap_or_default() {
                 "incoming" => {
@@ -303,6 +309,7 @@ impl Gallery {
                 }
                 "navigate" => {
                     if self.editor.is_none()
+                        && self.studio.is_none()
                         && !self.info
                         && !self.settings
                         && !self.export_dialog
@@ -323,7 +330,11 @@ impl Gallery {
                     self.notice(event["message"].as_str().unwrap_or("Photo edit failed"))
                 }
                 "external_copy" => self.notice("Editor copy saved to Pictures/Luma"),
-                "exported" => self.notice("Clip saved to Movies/Luma"),
+                "exported" => self.notice(if event["studio"] == true {
+                    "Video saved to Movies/Luma"
+                } else {
+                    "Clip saved to Movies/Luma"
+                }),
                 "frame_saved" => self.notice("Frame saved to Pictures/Luma"),
                 "proxy" => {
                     self.proxy = true;
@@ -419,7 +430,7 @@ impl Gallery {
     }
 
     fn receive_shared(&mut self, items: Vec<MediaItem>) {
-        if self.editor.is_some() || self.trimming || self.crop_video {
+        if self.editor.is_some() || self.studio.is_some() || self.trimming || self.crop_video {
             self.pending_shared = Some(items);
         } else {
             self.open_shared(items);
@@ -441,6 +452,9 @@ impl Gallery {
     }
 
     fn open(&mut self, item: MediaItem) {
+        if let Some(studio) = self.studio.take() {
+            studio.save();
+        }
         #[cfg(target_os = "android")]
         if item.is_video() {
             if self.gpu.is_none() {
@@ -494,6 +508,14 @@ impl Gallery {
     }
     fn back(&mut self) {
         if self.pending_shared.take().is_some() {
+            return;
+        }
+        if let Some(studio) = &mut self.studio {
+            if studio.back()
+                && let Some(studio) = self.studio.take()
+            {
+                self.close_studio(studio);
+            }
             return;
         }
         if let Some(editor) = &mut self.editor {
@@ -1090,6 +1112,9 @@ impl Gallery {
                         if !item.is_video() && action(ui, "edit", "Edit photo") {
                             self.start_editor(item.clone());
                         }
+                        if item.is_video() && action(ui, "edit", "Edit video") {
+                            self.open_studio();
+                        }
                         if !item.is_video() && action(ui, "sparkles", "Open copy in another editor")
                         {
                             bridge::send(json!({"op":"photo_external","item":item}));
@@ -1557,6 +1582,9 @@ impl Gallery {
             if icons::button(ui, "crop", "Crop video", self.crop_video).clicked() {
                 self.crop_video = !self.crop_video;
                 bridge::send(json!({"op":"play","playing":false}));
+            }
+            if icons::button(ui, "edit", "Edit video", false).clicked() {
+                self.open_studio();
             }
             let saving_frame = self.native["frame_saving"].as_bool().unwrap_or(false);
             ui.add_enabled_ui(duration > 0 && !saving_frame, |ui| {
@@ -2179,6 +2207,9 @@ impl EguiApp for Gallery {
     fn on_pause(&mut self, _: &Host) {
         bridge::send(json!({"op":"play","playing":false}));
         self.save();
+        if let Some(studio) = &self.studio {
+            studio.save();
+        }
     }
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.frame += 1;
@@ -2225,7 +2256,9 @@ impl EguiApp for Gallery {
                         );
                     });
                 }
-                if let Some(editor) = &mut self.editor {
+                if self.studio.is_some() {
+                    self.studio_ui(ui, host);
+                } else if let Some(editor) = &mut self.editor {
                     if editor.ui(ui, host, &self.native) {
                         self.editor = None;
                         self.last_rect = None;
