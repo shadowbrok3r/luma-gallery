@@ -1,5 +1,18 @@
 # Verification
 
+## TikTok Sans (0.1.15, 2026-10-13)
+
+`fonts/TikTokSans.ttf` (google/fonts 1e1dba1d, OFL-1.1) is compiled into the library. Its axes
+are opsz 12–36, wdth 75–150, wght 300–900 (default 300) and slnt −6–0. Renders set wght 400 or
+700, slnt −6 for italic instead of the synthesized skew, and opsz from the size in points.
+
+- 77 host tests pass, including `tiktok_sans_uses_its_weight_slant_and_optical_size_axes`:
+  the axis ranges, the settings for bold italic and regular, heavier ink at weight 700 and
+  different outlines for italic.
+- On the s26ultra AVD the Style font picker lists Roboto, TikTok Sans, then the other device
+  fonts; a caption switched to TikTok Sans and then to italic showed its letterforms and slant.
+- `smoke-studio.py` (7 checks) and `smoke-captions.py` (5 checks) still pass.
+
 ## Speech Captions Release 0.1.14 (2026-10-13)
 
 Recognition: whisper.cpp 1.9.5 is built with NDK 28 as `libwhisper_exec.so` (2.1 MB on arm64

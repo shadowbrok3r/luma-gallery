@@ -49,7 +49,7 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
   caption on the video (it snaps to the center lines), resize/rotate with its corner handle or
   two fingers, and trim or move clips with timeline handles that snap to the playhead and edges.
   Layers can be hidden (also left out of exports), locked, renamed, recolored and reordered.
-- Text styles: device fonts (Roboto, Noto Serif, Source Sans Pro, Dancing Script, ...), size,
+- Text styles: bundled TikTok Sans and device fonts (Roboto, Noto Serif, Source Sans Pro, Dancing Script, ...), size,
   bold/italic/underline/caps, alignment, colors, outline, rounded box with opacity, drop shadow
   or glow, spacing and wrap width, plus presets (Classic, Subtitle, Glass, Yellow, Neon, ...).
   Captions and overlays fade or slide in and out. Canvas crop, audio volume/fades, undo/redo and

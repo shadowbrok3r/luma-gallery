@@ -19,10 +19,11 @@ The launcher and toolbar SVGs are original project assets.
 | EguiMobile | 0.1.4, 8098d9d3 | MIT or Apache-2.0 | https://github.com/shadowbrok3r/EguiMobile |
 | egui and egui_extras | 0.36 | MIT or Apache-2.0 | https://github.com/emilk/egui |
 | whisper.cpp and ggml | 1.9.5 | MIT | https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.tar.gz |
+| TikTok Sans | Variable (opsz, slnt, wdth, wght), google/fonts 1e1dba1d, SHA-256 0e7f0a3e | OFL-1.1 (`fonts/TikTokSans-OFL.txt`) | https://github.com/google/fonts/tree/1e1dba1da2af16f4d6e912e0750856ae980b097f/ofl/tiktoksans |
 | Whisper base model, ggml q5_1 | Hugging Face ggerganov/whisper.cpp 5359861c, SHA-256 422f1ae4 | MIT (OpenAI Whisper) | Downloaded on first use; not in the APK |
 
 Captions are rasterized with skrifa, harfrust and tiny-skia (MIT or Apache-2.0 / MIT /
-BSD-3-Clause) from the device's system fonts or the fonts egui already bundles (Ubuntu Light
+BSD-3-Clause) from the device's system fonts, the bundled TikTok Sans, or the fonts egui already bundles (Ubuntu Light
 under the Ubuntu Font Licence 1.0, Hack under MIT/Bitstream Vera, Noto Emoji under OFL-1.1),
 and are burned into exported videos as images.
 `Cargo.lock` records all Rust dependencies. `scripts/prepare-native.sh` records native versions,

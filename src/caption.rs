@@ -43,9 +43,16 @@ pub struct Face {
     pub index: u32,
     pub weight: u16,
     pub italic: bool,
-    /// Range of the `wght` axis.
+    /// Ranges of the `wght`, `slnt` and `opsz` axes.
     pub wght: Option<(f32, f32)>,
+    pub slnt: Option<(f32, f32)>,
+    pub opsz: Option<(f32, f32)>,
 }
+
+/// Axis settings for one render, such as `(*b"wght", 700.0)`.
+pub type Variations = Vec<([u8; 4], f32)>;
+
+pub const TIKTOK_SANS: &[u8] = include_bytes!("../fonts/TikTokSans.ttf");
 
 #[derive(Clone, Debug)]
 pub struct Family {
@@ -59,12 +66,22 @@ pub struct FontBook {
 }
 
 fn embedded(bytes: &'static [u8], weight: u16) -> Face {
+    let range = |tag: &[u8; 4]| {
+        FontRef::new(bytes).ok().and_then(|font| {
+            font.axes()
+                .iter()
+                .find(|a| a.tag() == Tag::new(tag))
+                .map(|a| (a.min_value(), a.max_value()))
+        })
+    };
     Face {
         source: Source::Embedded(bytes),
         index: 0,
         weight,
         italic: false,
-        wght: None,
+        wght: range(b"wght"),
+        slnt: range(b"slnt"),
+        opsz: range(b"opsz"),
     }
 }
 
@@ -82,6 +99,10 @@ impl FontBook {
                 Family {
                     name: "Ubuntu".into(),
                     faces: vec![embedded(epaint_default_fonts::UBUNTU_LIGHT, 300)],
+                },
+                Family {
+                    name: "TikTok Sans".into(),
+                    faces: vec![embedded(TIKTOK_SANS, 400)],
                 },
                 Family {
                     name: "Hack".into(),
@@ -136,6 +157,12 @@ impl FontBook {
                 .cmp(&(b.name != "Roboto"))
                 .then(a.name.cmp(&b.name))
         });
+        book.families.retain(|e| system.iter().all(|f| f.name != e.name));
+        // Bundled TikTok Sans follows Roboto; the other bundled families go last.
+        if let Some(i) = book.families.iter().position(|f| f.name == "TikTok Sans") {
+            let at = system.iter().position(|f| f.name != "Roboto").unwrap_or(system.len());
+            system.insert(at, book.families.remove(i));
+        }
         system.append(&mut book.families);
         book.families = system;
         let mut chain: Vec<Face> = fallbacks
@@ -147,6 +174,8 @@ impl FontBook {
                 weight: 400,
                 italic: false,
                 wght: None,
+                slnt: None,
+                opsz: None,
             })
             .collect();
         chain.append(&mut book.fallbacks);
@@ -169,8 +198,8 @@ impl FontBook {
             .unwrap_or(&self.families[0])
     }
 
-    /// Closest face; returns the face, a `wght` setting, and whether bold/italic must be synthesized.
-    pub fn resolve(&self, name: &str, bold: bool, italic: bool) -> (Face, Option<f32>, bool, bool) {
+    /// Closest face; returns the face, its weight and slant settings, and whether bold/italic must be synthesized.
+    pub fn resolve(&self, name: &str, bold: bool, italic: bool) -> (Face, Variations, bool, bool) {
         let family = self.family(name);
         let target = if bold { 700 } else { 400 };
         let face = family
@@ -181,15 +210,24 @@ impl FontBook {
                     Some((low, high)) => (target as f32).clamp(low, high) as i32,
                     None => f.weight as i32,
                 };
-                ((f.italic != italic) as i32 * 1000) + (weight - target).abs()
+                let slanted = f.italic || f.slnt.is_some_and(|(low, _)| low < 0.0);
+                ((slanted != italic) as i32 * 1000) + (weight - target).abs()
             })
             .cloned()
             .unwrap_or_else(|| embedded(epaint_default_fonts::UBUNTU_LIGHT, 300));
+        let mut variations = vec![];
         let wght = face.wght.map(|(low, high)| (target as f32).clamp(low, high));
+        if let Some(w) = wght {
+            variations.push((*b"wght", w));
+        }
+        let slant = face.slnt.filter(|(low, _)| italic && !face.italic && *low < 0.0);
+        if let Some((low, _)) = slant {
+            variations.push((*b"slnt", low));
+        }
         let weight = wght.map_or(face.weight as f32, |w| w);
         let fake_bold = bold && weight < 600.0;
-        let fake_italic = italic && !face.italic;
-        (face, wght, fake_bold, fake_italic)
+        let fake_italic = italic && !face.italic && slant.is_none();
+        (face, variations, fake_bold, fake_italic)
     }
 }
 
@@ -251,16 +289,20 @@ fn read_faces(path: &Path) -> Option<Vec<(String, Face)>> {
             weight = u16_at(&os2, 4).unwrap_or(400);
             italic |= u16_at(&os2, 62).unwrap_or(0) & 1 != 0;
         }
-        let mut wght = None;
+        let (mut wght, mut slnt, mut opsz) = (None, None, None);
         if let Some((at, len)) = table(b"fvar") {
             let fvar = read_at(&mut file, at as u64, (len as usize).min(4096))?;
             let start = u16_at(&fvar, 4)? as usize;
             let (count, size) = (u16_at(&fvar, 8)? as usize, u16_at(&fvar, 10)? as usize);
             for axis in 0..count {
                 let a = start + axis * size;
-                if fvar.get(a..a + 4) == Some(b"wght") {
-                    let fixed = |at| u32_at(&fvar, at).map(|v| v as i32 as f32 / 65536.0);
-                    wght = fixed(a + 4).zip(fixed(a + 12));
+                let fixed = |at| u32_at(&fvar, at).map(|v| v as i32 as f32 / 65536.0);
+                let range = fixed(a + 4).zip(fixed(a + 12));
+                match fvar.get(a..a + 4) {
+                    Some(b"wght") => wght = range,
+                    Some(b"slnt") => slnt = range,
+                    Some(b"opsz") => opsz = range,
+                    _ => {}
                 }
             }
         }
@@ -272,6 +314,8 @@ fn read_faces(path: &Path) -> Option<Vec<(String, Face)>> {
                 weight,
                 italic,
                 wght,
+                slnt,
+                opsz,
             },
         ));
     }
@@ -359,7 +403,7 @@ fn load(face: &Face) -> Option<Blob> {
 struct Loaded {
     blob: Blob,
     index: u32,
-    wght: Option<f32>,
+    variations: Variations,
 }
 
 impl Loaded {
@@ -367,10 +411,7 @@ impl Loaded {
         FontRef::from_index(&self.blob, self.index).ok()
     }
     fn location(&self, font: &FontRef) -> Location {
-        match self.wght {
-            Some(w) => font.axes().location([("wght", w)]),
-            None => Location::default(),
-        }
+        font.axes().location(self.variations.iter().map(|(tag, value)| (Tag::new(tag), *value)))
     }
 }
 
@@ -405,7 +446,7 @@ impl Faces<'_> {
             let loaded = Loaded {
                 blob,
                 index: face.index,
-                wght: None,
+                variations: vec![],
             };
             let hit = Self::covers(&loaded, c);
             self.loaded.push(loaded);
@@ -466,11 +507,14 @@ fn shape(text: &str, base: usize, faces: &mut Faces, px: f32, spacing: f32) -> (
         let units = font.metrics(Size::unscaled(), &loaded.location(&font)).units_per_em;
         let scale = px / units.max(1) as f32;
         let data = ShaperData::new(&font);
-        let instance = loaded.wght.map(|w| {
-            ShaperInstance::from_variations(&font, [Variation {
-                tag: Tag::new(b"wght"),
-                value: w,
-            }])
+        let instance = (!loaded.variations.is_empty()).then(|| {
+            ShaperInstance::from_variations(
+                &font,
+                loaded.variations.iter().map(|(tag, value)| Variation {
+                    tag: Tag::new(tag),
+                    value: *value,
+                }),
+            )
         });
         let shaper = data.shaper(&font).instance(instance.as_ref()).build();
         let mut buffer = UnicodeBuffer::new();
@@ -730,7 +774,11 @@ pub fn render_text_with(
     if text.trim().is_empty() {
         return empty();
     }
-    let (face, wght, fake_bold, fake_italic) = book.resolve(&style.font, style.bold, style.italic);
+    let (face, mut variations, fake_bold, fake_italic) = book.resolve(&style.font, style.bold, style.italic);
+    // Optical size follows the text size in points.
+    if let Some((low, high)) = face.opsz {
+        variations.push((*b"opsz", (px * 0.75).clamp(low, high)));
+    }
     let Some(blob) = load(&face) else {
         return empty();
     };
@@ -738,7 +786,7 @@ pub fn render_text_with(
         loaded: vec![Loaded {
             blob,
             index: face.index,
-            wght,
+            variations,
         }],
         pending: book.fallbacks.iter(),
     };
@@ -1185,14 +1233,38 @@ mod tests {
         std::fs::write(dir.join("junk.ttf"), b"not a font").unwrap();
         let book = FontBook::scan(&[dir.to_str().unwrap()], &[]);
         let names: Vec<&str> = book.families().iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["Hack", "Ubuntu", "Hack"]);
-        assert_eq!(book.families()[0].faces[0].weight, 400);
-        let (face, wght, fake_bold, fake_italic) = book.resolve("Hack", true, true);
-        assert!(matches!(face.source, Source::File(_)) && wght.is_none());
+        assert_eq!(names, ["TikTok Sans", "Hack", "Ubuntu"], "Bundled families a device also has are listed once");
+        assert_eq!(book.families()[1].faces[0].weight, 400);
+        let (face, variations, fake_bold, fake_italic) = book.resolve("Hack", true, true);
+        assert!(matches!(face.source, Source::File(_)) && variations.is_empty());
         assert!(fake_bold && fake_italic);
         let (face, ..) = book.resolve("Missing", false, false);
         assert_eq!(face, book.families()[0].faces[0]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tiktok_sans_uses_its_weight_slant_and_optical_size_axes() {
+        let book = FontBook::embedded();
+        let (face, variations, fake_bold, fake_italic) = book.resolve("TikTok Sans", true, true);
+        assert_eq!((face.wght, face.slnt, face.opsz), (Some((300.0, 900.0)), Some((-6.0, 0.0)), Some((12.0, 36.0))));
+        assert_eq!(variations, [(*b"wght", 700.0), (*b"slnt", -6.0)]);
+        assert!(!fake_bold && !fake_italic, "Bold and italic come from the axes");
+        assert_eq!(book.resolve("TikTok Sans", false, false).1, [(*b"wght", 400.0)]);
+        let ink = |style: &TextStyle| render_text_with(&book, style, 1000.0, 1000.0).image.pixels().filter(|p| p[3] > 128).count();
+        let plain = TextStyle {
+            text: "Luma captions".into(),
+            font: "TikTok Sans".into(),
+            outline: 0.0,
+            bold: false,
+            ..style("")
+        };
+        let heavy = TextStyle { bold: true, ..plain.clone() };
+        assert!(ink(&heavy) as f32 > ink(&plain) as f32 * 1.3, "wght 700 draws heavier strokes");
+        let upright = render_text_with(&book, &plain, 1000.0, 1000.0);
+        let slanted = render_text_with(&book, &TextStyle { italic: true, ..plain.clone() }, 1000.0, 1000.0);
+        assert_ne!(upright.image.as_raw(), slanted.image.as_raw(), "slnt changes the outlines");
+        assert!(ink(&plain) > 500);
     }
 
     #[test]

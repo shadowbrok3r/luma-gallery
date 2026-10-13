@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.15 — 2026-10-13
+
+Text styles: TikTok Sans is bundled and listed after Roboto. Its variable weight draws regular
+and bold, its slant axis draws italics, and its optical size follows the text size. Fonts a
+device also has are listed once.
+
 ## v0.1.14 — 2026-10-13
 
 Video editor: add more videos to the timeline from the Video tool (at the cut nearest the
