@@ -1,8 +1,11 @@
 //! Video edit projects: ordered segments of source videos plus overlay layers above them.
+use crate::color::Adjust;
 use crate::edit::Crop;
 use serde::{Deserialize, Serialize};
 
 pub const MIN_CLIP: i64 = 100;
+/// Slowest and fastest segment playback speeds.
+pub const SPEEDS: (f32, f32) = (0.25, 4.0);
 /// Slide distance as a fraction of the frame.
 pub const SLIDE: f32 = 0.08;
 pub const PALETTE: [[u8; 3]; 7] = [
@@ -416,7 +419,7 @@ pub struct Source {
     pub modified: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Segment {
     pub id: u64,
@@ -424,15 +427,54 @@ pub struct Segment {
     pub source: usize,
     pub source_in: i64,
     pub source_out: i64,
+    /// Timeline ms.
     pub fade_in: i64,
     pub fade_out: i64,
     /// Fades through white instead of black.
     pub white: bool,
+    /// Playback speed; the segment lasts its source range divided by this.
+    pub speed: f32,
+    pub color: Adjust,
+}
+
+impl Default for Segment {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            source: 0,
+            source_in: 0,
+            source_out: 0,
+            fade_in: 0,
+            fade_out: 0,
+            white: false,
+            speed: 1.0,
+            color: Adjust::default(),
+        }
+    }
 }
 
 impl Segment {
+    /// Timeline length.
     pub fn length(&self) -> i64 {
+        self.timeline(self.source_length())
+    }
+    pub fn source_length(&self) -> i64 {
         self.source_out - self.source_in
+    }
+    pub fn speed(&self) -> f64 {
+        if self.speed.is_finite() {
+            self.speed.clamp(SPEEDS.0, SPEEDS.1) as f64
+        } else {
+            1.0
+        }
+    }
+    /// Timeline ms that `source` ms of this segment take.
+    pub fn timeline(&self, source: i64) -> i64 {
+        (source as f64 / self.speed()).round() as i64
+    }
+    /// Source ms shown during `timeline` ms of this segment.
+    pub fn source(&self, timeline: i64) -> i64 {
+        (timeline as f64 * self.speed()).round() as i64
     }
 }
 
@@ -628,7 +670,10 @@ impl Project {
     /// Segment index and source time shown at timeline time `t`.
     pub fn source_at(&self, t: i64) -> (usize, i64) {
         self.locate(t)
-            .map(|(i, offset)| (i, self.segments[i].source_in + offset))
+            .map(|(i, offset)| {
+                let segment = &self.segments[i];
+                (i, (segment.source_in + segment.source(offset)).min(segment.source_out))
+            })
             .unwrap_or((0, 0))
     }
 
@@ -637,7 +682,7 @@ impl Project {
         let Some(segment) = self.segments.get(index) else {
             return self.length();
         };
-        self.starts()[index] + (source - segment.source_in).clamp(0, segment.length())
+        self.starts()[index] + segment.timeline((source - segment.source_in).clamp(0, segment.source_length())).min(segment.length())
     }
 
     /// Source ranges to play in order, as `[in, out, source]`.
@@ -646,6 +691,68 @@ impl Project {
             .iter()
             .map(|s| [s.source_in, s.source_out, s.source as i64])
             .collect()
+    }
+
+    /// Playback speed of each segment.
+    pub fn speeds(&self) -> Vec<f32> {
+        self.segments.iter().map(|s| s.speed() as f32).collect()
+    }
+
+    /// Sets segment `index`'s speed, stretching overlays over it and shifting later ones; returns whether it changed.
+    pub fn set_speed(&mut self, index: usize, speed: f32) -> bool {
+        let Some(segment) = self.segments.get(index) else {
+            return false;
+        };
+        let fastest = (segment.source_length() as f32 / MIN_CLIP as f32).max(SPEEDS.0);
+        let speed = speed.clamp(SPEEDS.0, SPEEDS.1).min(fastest);
+        if (segment.speed() as f32 - speed).abs() < 1e-4 {
+            return false;
+        }
+        let (start, before) = (self.starts()[index], segment.length());
+        let segment = &mut self.segments[index];
+        segment.speed = speed;
+        let after = segment.length();
+        (segment.fade_in, segment.fade_out) = (segment.fade_in.min(after / 2), segment.fade_out.min(after / 2));
+        self.retime(start, before, after);
+        true
+    }
+
+    /// Stretches overlay times inside `[start, start + before)` to `after` ms and shifts later ones, dropping clips left shorter than `MIN_CLIP`.
+    fn retime(&mut self, start: i64, before: i64, after: i64) {
+        if before <= 0 || before == after {
+            return;
+        }
+        let map = |t: i64| {
+            if t <= start {
+                t
+            } else if t >= start + before {
+                t + after - before
+            } else {
+                start + ((t - start) as f64 * after as f64 / before as f64).round() as i64
+            }
+        };
+        for layer in &mut self.layers {
+            let spans: Vec<(i64, i64)> = layer.clips.iter().map(|c| (map(c.start), map(c.end))).collect();
+            let clips = std::mem::take(&mut layer.clips);
+            for (i, mut clip) in clips.into_iter().enumerate() {
+                let (from, to) = spans[i];
+                let limit = spans.get(i + 1).map_or(i64::MAX, |next| next.0);
+                let to = to.max(from + MIN_CLIP).min(limit);
+                if to - from >= MIN_CLIP {
+                    (clip.start, clip.end) = (from, to);
+                    layer.clips.push(clip);
+                }
+            }
+        }
+    }
+
+    /// Ripples or cuts overlays after a segment starting at `start` changes from `before` to `after` ms long at its end.
+    fn resize(&mut self, start: i64, before: i64, after: i64) {
+        if after > before {
+            self.ripple(start + before, after - before);
+        } else {
+            self.cut_overlays(start + after, start + before);
+        }
     }
 
     /// Source time limits for segment `index`'s edges: its source's ends, or an adjacent piece of the same source.
@@ -678,7 +785,7 @@ impl Project {
             return false;
         }
         let id = self.id();
-        let cut = segment.source_in + offset;
+        let cut = segment.source_in + segment.source(offset);
         self.segments[index].source_out = cut;
         self.segments[index].fade_out = 0;
         self.segments.insert(
@@ -711,31 +818,30 @@ impl Project {
         };
         let start = self.starts()[index];
         let (floor, ceiling) = self.trim_bounds(index);
+        let shortest = segment.source(MIN_CLIP);
         let applied = if head {
-            (segment.source_in + delta).clamp(floor, segment.source_out - MIN_CLIP)
+            (segment.source_in + delta).clamp(floor, (segment.source_out - shortest).max(floor))
                 - segment.source_in
         } else {
-            (segment.source_out + delta).clamp(segment.source_in + MIN_CLIP, ceiling)
+            (segment.source_out + delta).clamp((segment.source_in + shortest).min(ceiling), ceiling)
                 - segment.source_out
         };
         if applied == 0 {
             return 0;
         }
-        let end = start + segment.length();
+        let before = segment.length();
         if head {
             self.segments[index].source_in += applied;
-            if applied > 0 {
-                self.cut_overlays(start, start + applied);
+            let removed = before - self.segments[index].length();
+            if removed > 0 {
+                self.cut_overlays(start, start + removed);
             } else {
-                self.ripple(start, -applied);
+                self.ripple(start, -removed);
             }
         } else {
             self.segments[index].source_out += applied;
-            if applied > 0 {
-                self.ripple(end, applied);
-            } else {
-                self.cut_overlays(end + applied, end);
-            }
+            let after = self.segments[index].length();
+            self.resize(start, before, after);
         }
         applied
     }
@@ -1222,6 +1328,41 @@ mod tests {
         assert_eq!(p.trim_segment(1, true, 99_999), 5500);
         assert_eq!(p.segments[1].length(), MIN_CLIP);
         assert_eq!(p.trim_segment(0, true, -50), 0);
+    }
+
+    #[test]
+    fn speed_changes_timeline_length_and_maps_both_ways() {
+        let mut p = project();
+        p.split(4000);
+        let inside = p.add_clip(text(1000, 2000));
+        let after = p.add_clip(text(6000, 7000));
+        assert!(p.set_speed(0, 2.0));
+        assert!(!p.set_speed(0, 2.0), "Unchanged");
+        assert_eq!((p.segments[0].length(), p.length()), (2000, 8000));
+        assert_eq!(p.ranges(), [[0, 4000, 0], [4000, 10_000, 0]], "Source ranges stay");
+        assert_eq!(p.speeds(), [2.0, 1.0]);
+        let inside_span = |p: &Project| (p.clip(inside).unwrap().start, p.clip(inside).unwrap().end);
+        assert_eq!((inside_span(&p), p.clip(after).unwrap().start), ((500, 1000), 4000), "Overlays over the segment speed up with it");
+        assert_eq!(p.source_at(1500), (0, 3000));
+        assert_eq!(p.source_at(2000), (1, 4000));
+        assert_eq!(p.timeline_at(0, 3000), 1500);
+        assert!(p.split(1000), "Splits at the source time shown");
+        assert_eq!(p.ranges(), [[0, 2000, 0], [2000, 4000, 0], [4000, 10_000, 0]]);
+        assert_eq!(p.speeds(), [2.0, 2.0, 1.0]);
+        assert!(p.set_speed(2, 0.5));
+        assert_eq!(p.length(), 14_000);
+        assert_eq!((p.clip(after).unwrap().start, p.clip(after).unwrap().end), (6000, 8000), "and slow down with it");
+        assert_eq!(p.trim_segment(2, false, -2000), -2000, "Trims in source ms");
+        assert_eq!(p.segments[2].length(), 8000);
+        assert_eq!(p.source_at(5000), (2, 5500));
+        assert!(p.set_speed(0, 99.0));
+        assert_eq!(p.segments[0].speed(), 4.0, "Clamped to the fastest");
+        let short = Segment { source_out: 200, ..Segment::default() };
+        p.segments.push(short);
+        p.set_speed(3, 4.0);
+        assert!(p.segments[3].length() >= MIN_CLIP, "Short pieces stay at least MIN_CLIP long");
+        let legacy: Segment = serde_json::from_str(r#"{"source_in":0,"source_out":5000}"#).unwrap();
+        assert_eq!(legacy.speed, 1.0, "Projects saved before speed play at 1x");
     }
 
     fn video(uri: &str, duration: i64) -> Source {

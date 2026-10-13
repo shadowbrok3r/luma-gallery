@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.16 — 2026-10-13
+
+Video editor: Speed plays a segment from 0.25x to 4x with the sound's pitch kept; captions over
+it stretch with it. Adjust grades a segment with exposure, brightness, contrast, highlights,
+shadows, whites, blacks, temperature, tint, vibrance and saturation, shown live on the video and
+applied in exports through the same color table. Playback controls sit under the timeline, and
+the tools are grouped under Video, Text, Overlay and Canvas tabs instead of one scrolling row.
+Viewer: speed, loop and sound get their own row beside the resolution and frame rate, which
+Export clip no longer covers; play, frame steps and previous/next are on the bottom row.
+Settings > Playback controls places these controls on the right, left or center.
+Fixed: Remove captions crashed the app when the captions were the top layer. Pausing a sped-up
+segment now shows the frame at the reported time.
+
 ## v0.1.15 — 2026-10-13
 
 Text styles: TikTok Sans is bundled and listed after Roboto. Its variable weight draws regular

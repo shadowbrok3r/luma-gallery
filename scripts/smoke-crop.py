@@ -137,15 +137,15 @@ def photo_checks(d, work):
 
 def video_checks(d, work, name):
     editing["open_fixture"](d, name)
-    d.tap(111, 2865); d.tap(267, 2865)  # Explored Trim and Crop SVG controls.
+    d.tap_icon("Trim video", (112, 2714)); d.tap_icon("Crop video", (273, 2714))
     d.wait_text("Keep audio in clip")
-    editing["numeric"](d, 300, 2440, 2)
-    editing["numeric"](d, 700, 2440, 6)
-    d.tap_text("1:1", (257, 2610))
+    editing["numeric"](d, 300, editing["trim_y"](d), 2)
+    editing["numeric"](d, 700, editing["trim_y"](d), 6)
+    d.tap_text("1:1", (257, 2470))
     move_to_start(d, name + "-square-moved", horizontal=name == "Clip-Beats")
     shrink(d, name + "-smaller")
     before = editing["names"](d, "/sdcard/Movies/Luma", name + "_clip_")
-    d.tap_text("Export clip", (1200, 2820)); d.wait_text("Save clip")
+    d.tap_text("Export clip", (1240, 2730)); d.wait_text("Save clip")
     d.tap_text("Save clip", (522, 1941))
     path = editing["collect"](d, "/sdcard/Movies/Luma", name + "_clip_", before, work / (name + ".mp4"))
     probe = json.loads(run("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path))

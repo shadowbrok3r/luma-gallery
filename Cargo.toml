@@ -1,6 +1,6 @@
 [package]
 name = "luma_gallery"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 publish = false
 license = "GPL-3.0-or-later"
@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-egui-mobile = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "8098d9d3460a425a68b34731271ed6fc643025fc" }
+egui-mobile = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "3677b262fe5af05673213ebeacbf51ded59e3ea7" }
 egui = "0.36"
 egui_extras = { version = "0.36", default-features = false, features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -25,7 +25,7 @@ epaint_default_fonts = "0.36"
 jni = "0.21"
 
 [patch.crates-io]
-android-activity = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "8098d9d3460a425a68b34731271ed6fc643025fc" }
+android-activity = { git = "https://github.com/shadowbrok3r/EguiMobile", rev = "3677b262fe5af05673213ebeacbf51ded59e3ea7" }
 
 [profile.release]
 lto = "thin"

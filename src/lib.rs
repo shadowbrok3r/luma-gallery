@@ -1,6 +1,7 @@
 mod app;
 mod bridge;
 mod caption;
+mod color;
 mod compose;
 mod edit;
 mod icons;

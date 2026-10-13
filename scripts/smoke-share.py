@@ -170,9 +170,10 @@ def main(args):
         assert warm_pid == pid, f"Warm share recreated the process: {pid} -> {warm_pid}"
         d.wait_text("00:12")
         deadline = time.monotonic() + 15
+        video = d.bounds("Video lane", [84, 2093, 1370, 2254])
         while time.monotonic() < deadline:
             shot = d.screen()
-            lane = shot.crop((shot.width*.05, shot.height*.785, shot.width*.94, shot.height*.825))
+            lane = shot.crop((video[0], video[3] + 35, video[2], video[3] + 175))  # The audio lane under the frames.
             if sum(r < 100 and g > 140 and b > 120 for r, g, b in lane.getdata()) > 100:
                 break
             time.sleep(.2)
@@ -185,7 +186,7 @@ def main(args):
         d.rendered("Shared-Photo.png", "mixed-share-first")
         d.shell("input", "swipe", 1200, 1600, 400, 1600, 350)
         d.rendered("Shared-Clip.mp4", "mixed-share-video")
-        d.tap(750, 2714)  # Next item icon, beside frame-step controls.
+        d.tap_icon("Next video", (1321, 2868))
         d.rendered("Shared-Second.webp", "mixed-share-last")
         d.shell("input", "keyevent", 4)
         d.wait_text("Luma Gallery")

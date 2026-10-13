@@ -22,6 +22,39 @@ enum View {
 
 const ACTION_BAR: f32 = 56.0;
 
+/// Side of the screen that playback controls sit on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Hand {
+    #[default]
+    Right,
+    Left,
+    Center,
+}
+
+/// Layout choices kept in `luma-settings.json`.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Layout {
+    hand: Hand,
+}
+
+/// Adds `controls` in order on the `hand` side of the rest of a horizontal row, sized by the previous pass.
+fn handed(ui: &mut egui::Ui, hand: Hand, salt: &str, controls: impl FnOnce(&mut egui::Ui)) {
+    let id = egui::Id::new(("handed", salt));
+    let width = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    let free = (ui.available_width() - width - ui.spacing().item_spacing.x).max(0.0);
+    ui.add_space(match hand {
+        Hand::Left => 0.0,
+        Hand::Center => free / 2.0,
+        Hand::Right => free,
+    });
+    let used = ui.scope(controls).response.rect.width();
+    if (used - width).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, used));
+        ui.ctx().request_discard("handed row width");
+    }
+}
+
 pub struct Gallery {
     items: Vec<MediaItem>,
     trash: Vec<MediaItem>,
@@ -71,6 +104,9 @@ pub struct Gallery {
     crop_drag: Option<editor::CropDrag>,
     keep_audio: bool,
     waveform: crate::edit::Waveform,
+    layout: Layout,
+    /// Color table on the video surface.
+    graded: crate::color::Adjust,
     #[cfg(target_os = "android")]
     gpu: Option<egui_mobile::video::GpuVideoSurface>,
     #[cfg(target_os = "android")]
@@ -128,6 +164,8 @@ impl Gallery {
             crop_drag: None,
             keep_audio: true,
             waveform: crate::edit::Waveform::default(),
+            layout: Layout::default(),
+            graded: crate::color::Adjust::default(),
             #[cfg(target_os = "android")]
             gpu: None,
             #[cfg(target_os = "android")]
@@ -149,6 +187,21 @@ impl Gallery {
             if let Ok(bytes) = serde_json::to_vec(&self.favorites) {
                 let _ = std::fs::write(path, bytes);
             }
+            if let Ok(bytes) = serde_json::to_vec(&self.layout) {
+                let _ = std::fs::write(path.with_file_name("luma-settings.json"), bytes);
+            }
+        }
+    }
+
+    /// Grades the video surface with `color`, rebuilding its table only when it changes.
+    fn grade(&mut self, color: crate::color::Adjust) {
+        if self.graded == color {
+            return;
+        }
+        self.graded = color;
+        #[cfg(target_os = "android")]
+        if let Some(surface) = &self.gpu {
+            surface.set_lut((!color.is_neutral()).then(|| (crate::color::LUT_SIZE as u32, color.strip())));
         }
     }
 
@@ -1174,9 +1227,9 @@ impl Gallery {
             return;
         }
         let control_height = if item.is_video() {
-            // Video and audio lanes, playback, trim, and export controls.
-            238.0
-                + ui.spacing().item_spacing.y * 4.0
+            // Time, video and audio lanes, options, tools and playback rows.
+            278.0
+                + ui.spacing().item_spacing.y * 5.0
                 + if self.trimming {
                     40.0 + ui.spacing().item_spacing.y
                 } else {
@@ -1350,6 +1403,8 @@ impl Gallery {
             },
         );
         ui.painter().rect_filled(stage, 0, Color32::BLACK);
+        icons::note(ui, "Media stage", stage);
+        self.grade(crate::color::Adjust::default());
         #[cfg(target_os = "android")]
         if item.is_video() && self.native["playback"]["uri"] == item.uri {
             let width = self.native["playback"]["width"].as_u64().unwrap_or(0) as u32;
@@ -1441,63 +1496,22 @@ impl Gallery {
             });
         });
         self.draw_timeline(ui, item, duration);
-        ui.horizontal(|ui| {
-            if icons::button(ui, "previous", "Previous video", false).clicked() {
-                self.neighbor(-1);
+        let hand = self.layout.hand;
+        let info = egui::RichText::new(if self.proxy {
+            "Playback proxy".into()
+        } else {
+            format!("{}p  {:.2} fps", item.height, self.timeline.fps)
+        })
+        .size(11.0)
+        .color(MUTED);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 40.0), egui::Layout::left_to_right(Align::Center), |ui| {
+            if hand == Hand::Left {
+                self.playback_options(ui);
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| ui.label(info));
+            } else {
+                ui.label(info);
+                handed(ui, hand, "viewer_options", |ui| self.playback_options(ui));
             }
-            if icons::button(ui, "step_back", "Previous frame", false).clicked() {
-                self.seek(self.timeline.step_time(-1, duration), true);
-            }
-            if icons::button(
-                ui,
-                if self.playing() { "pause" } else { "play" },
-                if self.playing() { "Pause" } else { "Play" },
-                true,
-            )
-            .clicked()
-            {
-                if self.timeline.position >= duration - 50 {
-                    self.seek(if self.looped { self.timeline.start } else { 0 }, false);
-                }
-                bridge::send(json!({"op":"play","playing":!self.playing()}));
-            }
-            if icons::button(ui, "step_forward", "Next frame", false).clicked() {
-                self.seek(self.timeline.step_time(1, duration), true);
-            }
-            if icons::button(ui, "next", "Next video", false).clicked() {
-                self.neighbor(1);
-            }
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                let muted = self.native["playback"]["muted"].as_bool().unwrap_or(false);
-                if icons::button(
-                    ui,
-                    if muted { "mute" } else { "volume" },
-                    "Toggle audio",
-                    muted,
-                )
-                .clicked()
-                {
-                    bridge::send(json!({"op":"mute","muted":!muted}));
-                }
-                if icons::button(ui, "loop", "Loop selection", self.looped).clicked() {
-                    self.looped = !self.looped;
-                    self.sync_loop();
-                }
-                let rate = self.native["playback"]["rate"].as_f64().unwrap_or(1.0);
-                egui::ComboBox::from_id_salt("rate")
-                    .width(46.0)
-                    .selected_text(format!("{rate}x"))
-                    .show_ui(ui, |ui| {
-                        for speed in [0.25, 0.5, 1.0, 1.5, 2.0] {
-                            if ui
-                                .selectable_label((rate - speed).abs() < 0.01, format!("{speed}x"))
-                                .clicked()
-                            {
-                                bridge::send(json!({"op":"rate","rate":speed}));
-                            }
-                        }
-                    });
-            });
         });
         if self.trimming {
             ui.horizontal(|ui| {
@@ -1596,15 +1610,6 @@ impl Gallery {
                     );
                 }
             });
-            ui.label(
-                egui::RichText::new(if self.proxy {
-                    "Playback proxy".into()
-                } else {
-                    format!("{}p  {:.2} fps", item.height, self.timeline.fps)
-                })
-                .size(11.0)
-                .color(MUTED),
-            );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
@@ -1632,6 +1637,61 @@ impl Gallery {
                 }
             });
         });
+        ui.horizontal(|ui| {
+            handed(ui, hand, "viewer_transport", |ui| {
+                if icons::button(ui, "previous", "Previous video", false).clicked() {
+                    self.neighbor(-1);
+                }
+                if icons::button(ui, "step_back", "Previous frame", false).clicked() {
+                    self.seek(self.timeline.step_time(-1, duration), true);
+                }
+                if icons::button(
+                    ui,
+                    if self.playing() { "pause" } else { "play" },
+                    if self.playing() { "Pause" } else { "Play" },
+                    true,
+                )
+                .clicked()
+                {
+                    if self.timeline.position >= duration - 50 {
+                        self.seek(if self.looped { self.timeline.start } else { 0 }, false);
+                    }
+                    bridge::send(json!({"op":"play","playing":!self.playing()}));
+                }
+                if icons::button(ui, "step_forward", "Next frame", false).clicked() {
+                    self.seek(self.timeline.step_time(1, duration), true);
+                }
+                if icons::button(ui, "next", "Next video", false).clicked() {
+                    self.neighbor(1);
+                }
+            });
+        });
+    }
+
+    /// Playback speed, loop and sound, left to right.
+    fn playback_options(&mut self, ui: &mut egui::Ui) {
+        let rate = self.native["playback"]["rate"].as_f64().unwrap_or(1.0);
+        egui::ComboBox::from_id_salt("rate")
+            .width(46.0)
+            .selected_text(format!("{rate}x"))
+            .show_ui(ui, |ui| {
+                for speed in [0.25, 0.5, 1.0, 1.5, 2.0] {
+                    if ui
+                        .selectable_label((rate - speed).abs() < 0.01, format!("{speed}x"))
+                        .clicked()
+                    {
+                        bridge::send(json!({"op":"rate","rate":speed}));
+                    }
+                }
+            });
+        if icons::button(ui, "loop", "Loop selection", self.looped).clicked() {
+            self.looped = !self.looped;
+            self.sync_loop();
+        }
+        let muted = self.native["playback"]["muted"].as_bool().unwrap_or(false);
+        if icons::button(ui, if muted { "mute" } else { "volume" }, "Toggle audio", muted).clicked() {
+            bridge::send(json!({"op":"mute","muted":!muted}));
+        }
     }
 
     fn seek(&mut self, time: i64, pause: bool) {
@@ -1660,6 +1720,7 @@ impl Gallery {
             pos2(rail.left(), rail.bottom() + 10.0),
             vec2(rail.width(), 40.0),
         );
+        icons::note(ui, "Video lane", rail);
         let (begin, end) = self.timeline.window(duration);
         let span = (end - begin).max(1);
         for n in 0..8 {
@@ -1973,6 +2034,15 @@ impl Gallery {
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .fixed_size(vec2(width, 440.0))
                 .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Playback controls");
+                        for (hand, label) in [(Hand::Right, "Right"), (Hand::Left, "Left"), (Hand::Center, "Center")] {
+                            if ui.add(egui::Button::new(label).selected(self.layout.hand == hand)).clicked() {
+                                self.layout.hand = hand;
+                                self.save();
+                            }
+                        }
+                    });
                     if ui
                         .checkbox(&mut self.software, "Force software video decoding")
                         .changed()
@@ -2201,6 +2271,9 @@ impl EguiApp for Gallery {
             if let Ok(data) = std::fs::read(&path) {
                 self.favorites = serde_json::from_slice(&data).unwrap_or_default();
             }
+            if let Ok(data) = std::fs::read(path.with_file_name("luma-settings.json")) {
+                self.layout = serde_json::from_slice(&data).unwrap_or_default();
+            }
             self.preferences = Some(path);
         }
     }
@@ -2212,6 +2285,7 @@ impl EguiApp for Gallery {
         }
     }
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
+        icons::begin();
         self.frame += 1;
         self.pump(ui.ctx());
         if ui.input_mut(|i| {
@@ -2351,6 +2425,7 @@ impl EguiApp for Gallery {
             } else {
                 180
             }));
+        icons::report();
     }
 }
 

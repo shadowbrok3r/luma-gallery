@@ -253,30 +253,37 @@ def numeric(d, x, y, value):
     time.sleep(.15)  # Select All lands on the next frame.
     d.shell("input", "text", str(value)); d.shell("input", "keyevent", "KEYCODE_ENTER")
     ime_state(d, False)
-    d.tap(855, 2550)
+    d.tap(900, trim_y(d))  # Empty part of the trim row ends the edit.
+
+
+def trim_y(d):
+    """Middle of the viewer's in and out row."""
+    top, bottom = d.bounds("Set in point", [42, 2190, 182, 2330])[1::2]
+    return (top + bottom) // 2
 
 
 def clip_check(d, work, name, mute=False):
     open_fixture(d, name)
-    d.tap(111, 2865); d.tap(267, 2865)  # Trim and Crop SVGs.
+    d.tap_icon("Trim video", (112, 2714)); d.tap_icon("Crop video", (273, 2714))
     d.wait_text("Keep audio in clip")
-    numeric(d, 300, 2440, 2)
-    numeric(d, 700, 2440, 6)
-    d.tap_text("1:1", (257, 2610))
+    numeric(d, 300, trim_y(d), 2)
+    numeric(d, 700, trim_y(d), 6)
+    d.tap_text("1:1", (257, 2470))
     d.screen(name + "-trim-waveform-crop")
     # Color peaks must form a separate lane beneath the thumbnails.
     im=d.screen().convert("RGB")
+    lane=d.bounds("Video lane", [84, 1797, 1370, 1958])
     if not mute:
         counts=[]
         for i in range(6):
             x=round(im.width*(.06+.9*(i*2/12)))
-            band=im.crop((max(0,x-10),round(im.height*.658),min(im.width,x+22),round(im.height*.695)))
+            band=im.crop((max(0,x-10),lane[3]+50,min(im.width,x+22),lane[3]+165))
             pixels=band.tobytes()
             counts.append(sum(g>110 and b>90 and r<90 for r,g,b in zip(pixels[0::3],pixels[1::3],pixels[2::3])))
         # The trimmed-out peaks are deliberately dimmed; two retained transients remain bright.
         assert sum(c>20 for c in counts)>=2, counts
     before=names(d,"/sdcard/Movies/Luma",name+"_clip_")
-    d.tap_text("Export clip",(1200,2820));d.wait_text("Save clip")
+    d.tap_text("Export clip",(1240,2730));d.wait_text("Save clip")
     if mute:
         d.tap_text("Keep audio in clip",(310,1425))
     d.tap_text("Save clip",(522,1941))

@@ -52,7 +52,19 @@ def open_video(d, name):
             "-n", "app.luma.gallery/.GalleryActivity")
     d.wait_text(name)
     d.wait_text("Export clip")
-    d.tap(433, 2715)  # Pause transport, verified before tests were authored.
+    d.tap_icon("Pause", (999, 2868))
+
+
+def lane_y(d):
+    """Middle of the viewer's video lane."""
+    top, bottom = d.bounds("Video lane", [84, 2093, 1370, 2254])[1::2]
+    return (top + bottom) // 2
+
+
+def stage(d):
+    left, top, right, bottom = d.bounds("Media stage", [42, 313, 1412, 1880])
+    middle = (top + bottom) // 2
+    return d.screen().crop((left + 3, middle - 375, right - 17, middle + 375))
 
 
 def reference(path, milliseconds):
@@ -68,7 +80,7 @@ def loupe(d):
     shot = d.screen()
     pixels = np.asarray(shot)
     mask = (pixels[:, :, 0] > 210) & (pixels[:, :, 1] < 110) & (pixels[:, :, 2] > 100)
-    mask[:round(shot.height * .52)] = False
+    mask[:round(shot.height * .45)] = False
     mask[round(shot.height * .71):] = False
     yy, xx = np.where(mask)
     assert len(xx) > 100, "No scrub preview border"
@@ -104,17 +116,18 @@ def await_loupe(d, source, name, minimum_time=None):
 
 def preview_checks(d, source, name):
     # Keep a single pointer down while moving, then verify the decoder settles.
+    y = lane_y(d)
     try:
-        d.motion("DOWN", 300, 2320)
-        d.motion("MOVE", 520, 2320)
+        d.motion("DOWN", 300, y)
+        d.motion("MOVE", 520, y)
         first, first_at = await_loupe(d, source, name + "-early")
-        d.motion("MOVE", 1030, 2320)
+        d.motion("MOVE", 1030, y)
         second, second_at = await_loupe(d, source, name + "-later", minimum_time=first_at + 5000)
         assert second_at > first_at + 5000, (first_at, second_at)
         assert rms(first.resize((128, 72)), second.resize((128, 72))) > 5, "Preview stayed static"
         d.checks.append(name + "-moving-preview-correct-video-and-time")
     finally:
-        d.motion("UP", 1030, 2320)
+        d.motion("UP", 1030, y)
     deadline = time.monotonic() + 5
     while True:
         try:
@@ -128,7 +141,7 @@ def preview_checks(d, source, name):
 def capture(d, source, name):
     prefix = source.stem + "_frame_"
     before = names(d, "/sdcard/Pictures/Luma", prefix)
-    d.tap(433, 2865)  # Camera SVG beside crop, verified by saving an actual frame.
+    d.tap_icon("Save current frame as photo", (595, 2714))
     output = collect(d, "/sdcard/Pictures/Luma", prefix, before, d.evidence / (name + ".png"))
     added = names(d, "/sdcard/Pictures/Luma", prefix) - before
     assert len(added) == 1
@@ -168,21 +181,21 @@ def main(args):
         pid = min(map(int, d.shell("pidof", "app.luma.gallery").split()))
         preview_checks(d, originals / "Frame-A.mp4", "audio")
         at = capture(d, originals / "Frame-A.mp4", "audio-capture")
-        d.tap(592, 2715)  # Next-frame transport.
+        d.tap_icon("Next frame", (1160, 2868))
         step = capture(d, originals / "Frame-A.mp4", "stepped-capture")
         assert 0 < step - at <= 34, (at, step)  # The arbitrary scrub time advances to the next frame boundary.
         assert rms(Image.open(work / "audio-capture.png").convert("RGB"),
                    Image.open(work / "stepped-capture.png").convert("RGB")) > 10
         d.checks.append("capture-honors-a-pending-single-frame-step")
-        d.tap(433, 2715)  # Resume, then capture during playback.
+        d.tap_icon("Play", (999, 2868))  # Resume, then capture during playback.
         time.sleep(.3)
         playing = capture(d, originals / "Frame-A.mp4", "playing-capture")
         assert playing > step
-        first = d.screen().crop((45, 800, 1395, 1550))
+        first = stage(d)
         time.sleep(.4)
-        assert rms(first, d.screen().crop((45, 800, 1395, 1550))) == 0, "Capture did not pause playback"
+        assert rms(first, stage(d)) == 0, "Capture did not pause playback"
         d.checks.append("capture-during-playback-pauses-the-video")
-        d.tap(1390, 2320)  # End of rail clamps to the duration.
+        d.tap(d.bounds("Video lane", [84, 2093, 1370, 2254])[2] + 20, lane_y(d))  # Past the rail clamps to the duration.
         end = capture(d, originals / "Frame-A.mp4", "end-capture")
         assert end >= 19950, end
         open_video(d, "Frame-B.webm")
@@ -191,7 +204,8 @@ def main(args):
         preview_checks(d, originals / "Frame-B.webm", "silent-warm-switch")
         capture(d, originals / "Frame-B.webm", "silent-capture")
         # Exercise sustained movement, not just a stationary request.
-        swipe = subprocess.Popen(["adb", "-s", d.serial, "shell", "input", "swipe", "250", "2320", "1150", "2320", "8000"])
+        y = lane_y(d)
+        swipe = subprocess.Popen(["adb", "-s", d.serial, "shell", "input", "swipe", "250", str(y), "1150", str(y), "8000"])
         try:
             time.sleep(1.5)
             first, at1 = await_loupe(d, originals / "Frame-B.webm", "continuous-early")
@@ -202,18 +216,18 @@ def main(args):
             swipe.wait(timeout=15)
         d.checks.append("continuous-drag-decodes-progress-without-starvation")
         try:
-            d.motion("DOWN", 520, 2320)
-            d.motion("MOVE", 520, 2290)
+            d.motion("DOWN", 520, y)
+            d.motion("MOVE", 520, y - 30)
             _, at = await_loupe(d, originals / "Frame-B.webm", "precision-normal")
-            d.motion("MOVE", 520, 1780)
+            d.motion("MOVE", 520, y - 540)
             d.wait_text("20x")
             _, precise_at = await_loupe(d, originals / "Frame-B.webm", "precision-fine")
             assert abs(precise_at - at) <= 1, (at, precise_at)
         finally:
-            d.motion("UP", 520, 1780)
+            d.motion("UP", 520, y - 540)
         d.checks.append("precision-label-updates-without-a-time-change")
         open_video(d, "Frame-Rotated.mov")
-        d.tap(720, 2320)
+        d.tap(720, lane_y(d))
         capture(d, originals / "Frame-Rotated.mov", "rotated-capture")
         open_video(d, "Frame-Fallback.mp4")
         d.wait_text("No audio track")

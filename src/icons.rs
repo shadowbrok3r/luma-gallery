@@ -1,4 +1,59 @@
-use egui::{Color32, Image, Response, Ui, Vec2};
+use egui::{Color32, Image, Rect, Response, Ui, Vec2};
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
+thread_local! {
+    /// Enabled controls drawn this pass: label and pixel bounds.
+    static SHOWN: RefCell<Vec<(String, [i32; 4])>> = const { RefCell::new(vec![]) };
+    static LOGGED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Whether the system property `debug.luma.automation` is 1.
+pub fn automation() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(target_os = "android")]
+        {
+            unsafe extern "C" {
+                fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
+            }
+            let mut value = [0 as std::ffi::c_char; 92];
+            let length = unsafe { __system_property_get(c"debug.luma.automation".as_ptr(), value.as_mut_ptr()) };
+            length == 1 && value[0] == b'1' as std::ffi::c_char
+        }
+        #[cfg(not(target_os = "android"))]
+        false
+    })
+}
+
+/// Records a labeled control for the automation log.
+pub fn note(ui: &Ui, label: &str, rect: Rect) {
+    if !automation() || !ui.is_enabled() || !ui.is_rect_visible(rect) {
+        return;
+    }
+    let r = rect.intersect(ui.clip_rect()) * ui.ctx().pixels_per_point();
+    let bounds = [r.left(), r.top(), r.right(), r.bottom()].map(|v| v.round() as i32);
+    SHOWN.with(|shown| shown.borrow_mut().push((label.to_owned(), bounds)));
+}
+
+/// Starts a pass's automation record.
+pub fn begin() {
+    SHOWN.with(|shown| shown.borrow_mut().clear());
+}
+
+/// Logs the pass's controls after a `LumaWidgets` prefix when they changed.
+pub fn report() {
+    if !automation() {
+        return;
+    }
+    let text = SHOWN.with(|shown| serde_json::to_string(&*shown.borrow()).unwrap_or_default());
+    LOGGED.with(|logged| {
+        if *logged.borrow() != text {
+            log::info!("LumaWidgets {text}");
+            *logged.borrow_mut() = text;
+        }
+    });
+}
 
 pub fn source(name: &str) -> &'static [u8] {
     macro_rules! icons { ($($key:literal),* $(,)?) => { match name { $($key => include_bytes!(concat!("../assets/icons/", $key, ".svg")),)* _ => include_bytes!("../assets/icons/info.svg") } }; }
@@ -55,6 +110,8 @@ pub fn source(name: &str) -> &'static [u8] {
         "undo",
         "sparkles",
         "waveform",
+        "speed",
+        "adjust",
         "text",
         "layers",
         "eye",
@@ -98,6 +155,7 @@ pub fn button(ui: &mut Ui, name: &str, label: &str, active: bool) -> Response {
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
+    note(ui, label, response.rect);
     response
 }
 

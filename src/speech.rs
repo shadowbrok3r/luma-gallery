@@ -1,5 +1,5 @@
 //! Words recognized by whisper.cpp and the caption clips built from them.
-use crate::studio::{Body, Clip, TextStyle};
+use crate::studio::{Body, Clip, Project, TextStyle};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
@@ -27,6 +27,17 @@ pub struct Transcript {
     pub words: Vec<Word>,
     /// The timeline the words were recognized from, as `Project::ranges`.
     pub ranges: Vec<[i64; 3]>,
+    /// `Project::speeds` then; empty in transcripts saved before speeds.
+    pub speeds: Vec<f32>,
+}
+
+impl Transcript {
+    /// Whether the words still line up with `project`'s timeline.
+    pub fn matches(&self, project: &Project) -> bool {
+        let speeds = project.speeds();
+        self.ranges == project.ranges()
+            && (self.speeds == speeds || self.speeds.is_empty() && speeds.iter().all(|s| *s == 1.0))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +151,7 @@ pub fn parse(bytes: &[u8]) -> Result<Transcript, String> {
     Ok(Transcript {
         language,
         words,
-        ranges: vec![],
+        ..Transcript::default()
     })
 }
 
@@ -344,7 +355,7 @@ mod tests {
         let transcript = Transcript {
             language: "en".into(),
             words: vec![word("Hello", 100, 400), word("there", 450, 700), word("friend", 3000, 3300)],
-            ranges: vec![],
+            ..Transcript::default()
         };
         let template = Clip {
             y: 0.8,

@@ -5,7 +5,8 @@ Requires adb, ffmpeg, Pillow, numpy and Tesseract (TESSDATA_PREFIX=.build/tessda
 Pushes a uniquely named 6 s clip to DCIM/Luma-Playback and checks the cases where LibVLC
 reached the end of its input: scrubbing and playing after the clip ended, playing again from
 the end, scrubbing while playing, scrubbing to the end while playing, and looping the whole
-clip. Control coordinates were verified with ADB screenshots on this AVD. Never deletes media.
+clip. Controls and lanes are found from the app's LumaWidgets log; coordinates measured with
+ADB screenshots on this AVD are fallbacks. Never deletes media.
 """
 import argparse
 import json
@@ -19,22 +20,35 @@ import numpy as np
 
 Device = runpy.run_path(str(Path(__file__).with_name("smoke-android.py")))["Device"]
 FOLDER = "/sdcard/DCIM/Luma-Playback"
-PLAY = (434, 2714)
-LOOP = (1181, 2714)
-RAIL_Y = 2324
-RAIL = (84, 1370)  # Timeline x range for the whole clip at 1x zoom.
+PLAY = (999, 2868)
+LOOP = (1160, 2560)
 LENGTH = 6000
 
 
+def rail(d):
+    """Video lane x range for the whole clip at 1x zoom, and its middle y."""
+    left, top, right, bottom = d.bounds("Video lane", [84, 2093, 1356, 2254])
+    return left, right, (top + bottom) // 2
+
+
+def toggle(d):
+    """Taps Play or Pause, whichever the viewer shows."""
+    shown = {name for name, _ in d.controls()}
+    d.tap_icon("Pause" if "Pause" in shown else "Play", PLAY)
+
+
 def position(d):
-    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, 2040, 760, 2150))))
+    top = d.bounds("Video lane", [84, 2093, 1356, 2254])[1]
+    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, top - 180, 760, top - 10))))
     match = re.search(r"(\d{2}):(\d{2})[.,](\d{3})", text)
     assert match, "No playhead time: " + text
     return int(match[1]) * 60000 + int(match[2]) * 1000 + int(match[3])
 
 
 def stage(d):
-    return np.asarray(d.screen().crop((100, 850, 1350, 1500)), np.int16)
+    left, top, right, bottom = d.bounds("Media stage", [42, 313, 1398, 1880])
+    middle = (top + bottom) // 2
+    return np.asarray(d.screen().crop((left + 60, middle - 320, right - 60, middle + 320)), np.int16)
 
 
 def moving(d):
@@ -48,8 +62,9 @@ def no_error(d):
     assert "could not play" not in text, "Playback error notice: " + text
 
 
-def x_for(ms):
-    return round(RAIL[0] + (RAIL[1] - RAIL[0]) * ms / LENGTH)
+def x_for(d, ms):
+    left, right, _ = rail(d)
+    return round(left + (right - left) * ms / LENGTH)
 
 
 def wait_end(d, timeout=12):
@@ -92,36 +107,37 @@ def main(args):
         d.screen("ended")
         d.checks.append("stops-at-end")
 
-        d.tap(x_for(3000), RAIL_Y)
+        y = rail(d)[2]
+        d.tap(x_for(d, 3000), y)
         time.sleep(1.5)
         at = position(d)
         assert abs(at - 3000) < 250, at
         assert not moving(d), "Seek after the end should stay paused"
-        d.tap(*PLAY)
+        toggle(d)
         plays_from(d, 3600, 5200)
         d.screen("plays-after-scrub")
         no_error(d)
         d.checks.append("scrub-after-end-then-play")
 
         wait_end(d)
-        d.tap(*PLAY)
+        toggle(d)
         plays_from(d, 600, 2600)
         no_error(d)
         d.checks.append("play-at-end-restarts")
 
-        d.adb("shell", "input", "swipe", str(x_for(800)), str(RAIL_Y), str(x_for(2500)), str(RAIL_Y), "500")
+        d.adb("shell", "input", "swipe", str(x_for(d, 800)), str(y), str(x_for(d, 2500)), str(y), "500")
         plays_from(d, 2900, 4700)
         no_error(d)
         d.checks.append("scrub-while-playing-resumes")
 
-        d.adb("shell", "input", "swipe", str(x_for(2500)), str(RAIL_Y), "1435", str(RAIL_Y), "500")
+        d.adb("shell", "input", "swipe", str(x_for(d, 2500)), str(y), "1435", str(y), "500")
         wait_end(d, 6)
-        d.tap(*PLAY)
+        toggle(d)
         plays_from(d, 600, 2600)
         no_error(d)
         d.checks.append("scrub-to-end-while-playing")
 
-        d.tap(*LOOP)
+        d.tap_icon("Loop selection", LOOP)
         samples = []
         deadline = time.monotonic() + 9
         while time.monotonic() < deadline:
@@ -131,7 +147,7 @@ def main(args):
         no_error(d)
         d.screen("looping")
         d.checks.append(f"loop-wraps-{len(samples)}-samples")
-        d.tap(*LOOP)
+        d.tap_icon("Loop selection", LOOP)
         success = True
     finally:
         (work / "results.json").write_text(json.dumps({"success": success, "checks": d.checks}, indent=2) + "\n")

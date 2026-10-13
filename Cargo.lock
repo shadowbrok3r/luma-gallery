@@ -50,7 +50,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "android-activity"
 version = "0.6.1"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "android-properties",
  "bitflags 2.13.2",
@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "egui-android"
 version = "0.1.4"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -601,7 +601,7 @@ dependencies = [
 [[package]]
 name = "egui-ios"
 version = "0.1.4"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "egui",
  "egui-ios-plugin-abi",
@@ -614,7 +614,7 @@ dependencies = [
 [[package]]
 name = "egui-ios-plugin-abi"
 version = "0.1.4"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "bytemuck",
  "egui",
@@ -627,7 +627,7 @@ dependencies = [
 [[package]]
 name = "egui-mobile"
 version = "0.1.4"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "egui-android",
  "egui-ios",
@@ -637,7 +637,7 @@ dependencies = [
 [[package]]
 name = "egui-mobile-core"
 version = "0.1.4"
-source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=8098d9d3460a425a68b34731271ed6fc643025fc#8098d9d3460a425a68b34731271ed6fc643025fc"
+source = "git+https://github.com/shadowbrok3r/EguiMobile?rev=3677b262fe5af05673213ebeacbf51ded59e3ea7#3677b262fe5af05673213ebeacbf51ded59e3ea7"
 dependencies = [
  "egui",
  "log",
@@ -1421,7 +1421,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "luma_gallery"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "egui",
  "egui-mobile",

@@ -47,21 +47,24 @@ def run(args):
         device.tap(1340, 230)  # File information.
         device.tap_text("Build playback proxy", (360, 1705))
         device.wait_text("Playback proxy", timeout=180)
-        device.tap(435, 2714)  # Pause the newly opened proxy.
-        device.tap(112, 2870)  # Trim controls.
+        device.tap_icon("Pause", (999, 2868))  # Pause the newly opened proxy.
+        device.tap_icon("Trim video", (112, 2714))
         device.wait_text("In")
         # The frame lane is above the separate audio lane. A held swipe lets
         # egui observe intermediate motion even when decoding delays a frame.
-        for origin, target in [(83, 450), (1363, 760)]:
+        lane = device.bounds("Video lane", [84, 1937, 1370, 2098])
+        y = (lane[1] + lane[3]) // 2
+        for origin, target in [(lane[0] - 1, 450), (lane[2] - 7, 760)]:
             device.foreground()
-            device.shell("input", "swipe", origin, 2170, target, 2170, 450)
+            device.shell("input", "swipe", origin, y, target, y, 450)
+        marks = device.bounds("Set in point", [42, 2490, 182, 2630])
         # Read the selected numeric bounds instead of assuming a gesture ends
         # at the same millisecond on every render cadence.
         deadline = time.monotonic() + 10
         while True:
             shot = device.screen(); w, h = shot.size
             fields = sorted((x, float(match[1])) for text, x, _ in
-                            device.lines(shot.crop((0, h * .84, w * .6, h * .9)))
+                            device.lines(shot.crop((0, marks[1] - 20, w * .6, marks[3] + 60)))
                             if (match := re.search(r"(\d+\.\d{3})", text)))
             if len(fields) == 2:
                 start, end = (field[1] for field in fields)
@@ -72,7 +75,7 @@ def run(args):
         device.screen("selection")
         for mode in ("fast", "exact"):
             before = exported_names(device)
-            device.tap_text("Export clip", (1160, 2870))
+            device.tap_text("Export clip", (1240, 2730))
             if mode == "fast":
                 device.tap_text("Fast / original quality", (325, 1325))
                 device.wait_text("00:03.570")

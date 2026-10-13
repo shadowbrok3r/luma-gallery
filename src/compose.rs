@@ -14,6 +14,13 @@ pub struct Settings {
     pub crf: u8,
     /// Frame rate for still overlay inputs, as FFmpeg's rational text.
     pub fps: String,
+    /// Directory holding `segment{i}.cube` for each color-adjusted segment `i`.
+    pub luts: Option<String>,
+}
+
+/// File name of segment `index`'s color lookup table inside `Settings::luts`.
+pub fn lut_name(index: usize) -> String {
+    format!("segment{index}.cube")
 }
 
 /// Arguments with `{sourceN}` (project source N) and `{output}` placeholders.
@@ -40,6 +47,30 @@ impl Job {
 
 fn sec(ms: i64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
+}
+
+/// Shortest decimal text of `value` with up to four places.
+fn number(value: f64) -> String {
+    let text = format!("{value:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// `atempo` filters, each within 0.5 to 2, that play audio at `speed` with its pitch kept.
+fn tempo(speed: f64) -> String {
+    let mut chain = String::new();
+    let mut left = speed;
+    while left > 2.0 + 1e-9 {
+        chain.push_str(",atempo=2");
+        left /= 2.0;
+    }
+    while left < 0.5 - 1e-9 {
+        chain.push_str(",atempo=0.5");
+        left /= 0.5;
+    }
+    if (left - 1.0).abs() > 1e-6 {
+        chain.push_str(&format!(",atempo={}", number(left)));
+    }
+    chain
 }
 
 pub fn job(project: &Project, overlays: &[Overlay], settings: &Settings) -> Job {
@@ -79,14 +110,21 @@ pub fn job(project: &Project, overlays: &[Overlay], settings: &Settings) -> Job 
         let (_, base, shared, has_audio) = bases[k];
         let (from, to) = (sec(segment.source_in - base), sec(segment.source_out - base));
         let color = if segment.white { ":color=white" } else { "" };
+        let speed = segment.speed();
+        let sped = (speed - 1.0).abs() > 1e-6;
         let mut video = format!(
-            "{}trim=start={from}:end={to},setpts=PTS-STARTPTS",
-            if shared { format!("[v{i}]") } else { format!("[{k}:v]") }
+            "{}trim=start={from}:end={to},setpts={}",
+            if shared { format!("[v{i}]") } else { format!("[{k}:v]") },
+            if sped { format!("(PTS-STARTPTS)/{}", number(speed)) } else { "PTS-STARTPTS".into() }
         );
+        if sped && uniform {
+            video.push_str(&format!(",fps={}", settings.fps));
+        }
         let mut sound = if has_audio {
             format!(
-                "{}atrim=start={from}:end={to},asetpts=PTS-STARTPTS",
-                if shared { format!("[a{i}]") } else { format!("[{k}:a]") }
+                "{}atrim=start={from}:end={to},asetpts=PTS-STARTPTS{}",
+                if shared { format!("[a{i}]") } else { format!("[{k}:a]") },
+                tempo(speed)
             )
         } else {
             format!("anullsrc=r=48000:cl=stereo,atrim=duration={}", sec(segment.length()))
@@ -98,6 +136,12 @@ pub fn job(project: &Project, overlays: &[Overlay], settings: &Settings) -> Job 
                 settings.fps
             ));
             sound.push_str(",aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo");
+        }
+        if let Some(dir) = settings.luts.as_ref().filter(|_| !segment.color.is_neutral()) {
+            video.push_str(&format!(
+                ",format=gbrp16le,lut3d=file='{dir}/{}':interp=tetrahedral,format=yuv420p",
+                lut_name(i)
+            ));
         }
         let mut fades = vec![];
         if segment.fade_in > 0 {
@@ -264,10 +308,11 @@ pub fn speech_job(project: &Project) -> Option<Job> {
         let format = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono";
         let piece = match inputs.iter().enumerate().find(|(_, (n, ..))| *n == segment.source) {
             Some((k, (_, base, users))) => format!(
-                "{}atrim=start={}:end={},asetpts=PTS-STARTPTS,{format}",
+                "{}atrim=start={}:end={},asetpts=PTS-STARTPTS{},{format}",
                 if users.len() > 1 { format!("[a{i}]") } else { format!("[{k}:a]") },
                 sec(segment.source_in - base),
-                sec(segment.source_out - base)
+                sec(segment.source_out - base),
+                tempo(segment.speed())
             ),
             None => format!("anullsrc=r=16000:cl=mono,atrim=duration={},{format}", sec(segment.length())),
         };
@@ -298,6 +343,7 @@ mod tests {
             max_height: 0,
             crf: 18,
             fps: "30".into(),
+            luts: None,
         }
     }
 
@@ -567,6 +613,121 @@ mod tests {
         assert!(red[0] > 180 && red[2] < 60, "Added video in the middle: {red:?}");
         assert!(frame(3.0, 0.1).iter().all(|c| *c < 30), "Letterboxed sides are black");
         assert!(frame(5.0, 0.5)[2] > 180, "Main video resumes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tempo_chains_stay_within_atempo_limits() {
+        assert_eq!(tempo(1.0), "");
+        assert_eq!(tempo(1.5), ",atempo=1.5");
+        assert_eq!(tempo(4.0), ",atempo=2,atempo=2");
+        assert_eq!(tempo(3.0), ",atempo=2,atempo=1.5");
+        assert_eq!(tempo(0.25), ",atempo=0.5,atempo=0.5");
+    }
+
+    #[test]
+    fn desktop_ffmpeg_plays_segments_at_their_speed() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("luma-speed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (main, output) = (dir.join("main.mp4"), dir.join("out.mp4"));
+        let path = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-filter_complex",
+            "color=c=red:s=320x180:r=30:d=2[r];color=c=lime:s=320x180:r=30:d=2[g];color=c=blue:s=320x180:r=30:d=2[b];[r][g][b]concat=n=3[v]",
+            "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", &path(&main),
+        ]);
+        let mut project = Project::new(&path(&main), "main.mp4", 6000, 320, 180);
+        project.split(2000);
+        project.split(4000);
+        project.set_speed(0, 2.0);
+        project.set_speed(2, 0.5);
+        assert_eq!(project.length(), 7000);
+        let job = job(&project, &[], &settings());
+        let graph = graph(&job).to_owned();
+        assert!(graph.contains("setpts=(PTS-STARTPTS)/2,fps=30") && graph.contains("asetpts=PTS-STARTPTS,atempo=2"), "{graph}");
+        assert!(graph.contains("setpts=(PTS-STARTPTS)/0.5,fps=30") && graph.contains("atempo=0.5"), "{graph}");
+        let args: Vec<String> = job
+            .args
+            .iter()
+            .map(|a| match a.as_str() {
+                "{source0}" => path(&main),
+                "{output}" => path(&output),
+                _ => a.clone(),
+            })
+            .collect();
+        ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        let output = path(&output);
+        let probe = String::from_utf8(
+            std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0", &output])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        for line in probe.lines() {
+            let duration: f64 = line.split(',').nth(1).unwrap().parse().unwrap();
+            assert!((duration - 7.0).abs() < 0.12, "{line}");
+        }
+        let color = |seconds: f64| {
+            let raw = ffmpeg(&["-ss", &format!("{seconds:.3}"), "-i", &output, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+            let at = (90 * 320 + 160) * 3;
+            [raw[at], raw[at + 1], raw[at + 2]]
+        };
+        let strongest = |c: [u8; 3]| (0..3).max_by_key(|&i| c[i]).unwrap();
+        for (seconds, channel) in [(0.5, 0), (1.3, 1), (2.8, 1), (3.3, 2), (6.6, 2)] {
+            assert_eq!(strongest(color(seconds)), channel, "{seconds} s: {:?}", color(seconds));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn desktop_ffmpeg_colors_each_segment_like_the_preview() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("luma-color-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (main, output) = (dir.join("main.mp4"), dir.join("out.mp4"));
+        let path = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "color=c=0x8c5a3c:s=320x180:r=30:d=4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", &path(&main),
+        ]);
+        let mut project = Project::new(&path(&main), "main.mp4", 4000, 320, 180);
+        project.sources[0].has_audio = false;
+        project.split(2000);
+        project.segments[1].color = crate::color::Adjust { exposure: 0.7, temperature: -0.6, saturation: 0.4, ..Default::default() };
+        let cube = project.segments[1].color.cube();
+        std::fs::write(dir.join(lut_name(1)), cube).unwrap();
+        let job = job(&project, &[], &Settings { luts: Some(path(&dir)), ..settings() });
+        assert!(graph(&job).contains(&format!("lut3d=file='{}/segment1.cube'", path(&dir))), "{}", graph(&job));
+        assert!(!graph(&job).contains("segment0.cube"), "Neutral segments skip the table");
+        let args: Vec<String> = job
+            .args
+            .iter()
+            .map(|a| match a.as_str() {
+                "{source0}" => path(&main),
+                "{output}" => path(&output),
+                _ => a.clone(),
+            })
+            .collect();
+        ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        let pixel = |seconds: f64| {
+            let raw = ffmpeg(&["-ss", &format!("{seconds:.3}"), "-i", &path(&output), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+            let at = (90 * 320 + 160) * 3;
+            [raw[at], raw[at + 1], raw[at + 2]].map(|v| v as f32 / 255.0)
+        };
+        let before = pixel(1.0);
+        let expected = project.segments[1].color.apply(before);
+        let after = pixel(3.0);
+        assert!((0..3).all(|i| (after[i] - expected[i]).abs() < 0.035), "Export {after:?}, preview math {expected:?} from {before:?}");
+        assert!(after.iter().sum::<f32>() > before.iter().sum::<f32>() + 0.15, "Brighter: {before:?} -> {after:?}");
+        assert!(((0..3).all(|i| (pixel(1.5)[i] - before[i]).abs() < 0.01)), "The first segment is untouched");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

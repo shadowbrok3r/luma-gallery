@@ -5,8 +5,9 @@ Requires adb, ffmpeg/ffprobe, Pillow, numpy and Tesseract (TESSDATA_PREFIX=.buil
 Pushes a uniquely named synthetic clip to DCIM/Luma-Studio, opens it in the editor, adds a
 caption at 0 s, splits at about 4 s and 6 s, deletes the middle part and exports. The export
 in Movies/Luma is checked without the UI: duration, audio, the burned-in caption (OCR) and
-the cut (frames after it match the source two seconds later). Control coordinates were
-verified with ARTEMIS on this AVD. Never deletes media.
+the cut (frames after it match the source two seconds later). Controls are found by label and
+lanes by position from the app's LumaWidgets log; coordinates measured with ADB screenshots on
+this AVD are fallbacks. Never deletes media.
 """
 import argparse
 import io
@@ -22,8 +23,6 @@ from PIL import Image, ImageOps
 
 Device = runpy.run_path(str(Path(__file__).with_name("smoke-android.py")))["Device"]
 FOLDER = "/sdcard/DCIM/Luma-Studio"
-TOOL_Y = 2839
-FILM_Y = 2488
 CENTER_X = 807
 SCALE = 94.5  # Device pixels per second at the initial zoom of a 10 s clip.
 
@@ -52,8 +51,15 @@ def ocr(image, path):
     return subprocess.run(["tesseract", str(path), "-", "--psm", "7"], capture_output=True, text=True).stdout.upper()
 
 
+def film_y(d):
+    top, bottom = d.bounds("Film", [42, 2040, 1398, 2236])[1::2]
+    return (top + bottom) // 2
+
+
 def playhead(d):
-    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, 2000, 760, 2160))))
+    """Editor time from the playback row, left of its buttons."""
+    left, top, _, bottom = d.bounds("Go to start", [621, 2427, 761, 2567])
+    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, top - 20, left, bottom + 20))))
     match = re.search(r"(\d{2}):(\d{2})[.,](\d{3})", text)
     assert match, "No playhead time: " + text
     return int(match[1]) * 60000 + int(match[2]) * 1000 + int(match[3])
@@ -65,7 +71,8 @@ def scrub(d, ms):
     while remaining:
         step = max(-1100, min(1100, remaining))
         start = 1300 if step > 0 else 200
-        d.adb("shell", "input", "swipe", str(start), "2500", str(start - step), "2500", "600")
+        y = str(film_y(d))
+        d.adb("shell", "input", "swipe", str(start), y, str(start - step), y, "600")
         remaining -= step
     time.sleep(1.2)
 
@@ -90,39 +97,41 @@ def main(args):
         d.shell("am", "start", "-a", "android.intent.action.VIEW", "-d", f"file://{FOLDER}/{name}",
                 "-t", "video/mp4", "-n", "app.luma.gallery/.GalleryActivity")
         d.wait_text("Export clip")
-        d.tap(433, 2715)  # Pause.
-        d.tap(431, 2867)  # Edit video.
+        d.tap_icon("Pause", (999, 2868))
+        d.tap_icon("Edit video", (434, 2714))
         d.wait_text("Edit video")
         d.screen("editor-open")
         scrub(d, -12000)
         assert playhead(d) == 0, "Timeline did not reach the start"
         d.checks.append("timeline-scrubs-to-start")
-        d.tap(367, TOOL_Y)  # Text.
+        d.tap_icon("Text", (550, 2878))
+        d.tap_icon("Add text", (155, 2696))
         time.sleep(1)
         d.adb("shell", "input", "text", "LUMA%sSMOKE")
         time.sleep(.8)
         d.adb("shell", "input", "keyevent", "111")  # Closes the text panel.
         time.sleep(.8)
-        d.tap(1250, 1650)  # Empty stage deselects.
+        picture = d.bounds("Video frame", [56, 671, 1384, 1418])
+        d.tap(picture[2] - 134, picture[3] + 50)  # Empty stage deselects.
         d.screen("caption-added")
         start = playhead(d)
         scrub(d, 4000)
         first = playhead(d)
         assert 3500 < first < 4500, first
-        d.tap(150, TOOL_Y)  # Split.
+        d.tap_icon("Video", (211, 2878))
+        d.tap_icon("Split", (381, 2696))
         scrub(d, 2000)
         second = playhead(d)
         assert second - first > 1500, (first, second)
-        d.tap(150, TOOL_Y)  # Split the selected segment.
-        d.tap(CENTER_X - round(SCALE), FILM_Y)  # Middle segment, one second left of the playhead.
-        d.tap(1228, TOOL_Y)  # Delete.
+        d.tap_icon("Split", (155, 2696))  # Splits the selected segment.
+        d.tap(CENTER_X - round(SCALE), film_y(d))  # Middle segment, one second left of the playhead.
+        d.tap_icon("Delete", (1285, 2696))
         time.sleep(.8)
         d.screen("middle-removed")
         d.wait_text("/ 00:0")
         d.checks.append(f"split-at-{first}-and-{second}-and-delete")
         d.tap(1229, 229)  # Export header button.
-        d.wait_text("Export video")
-        d.tap(384, 2373)
+        d.tap_text("Export video", (384, 2220))
         deadline = time.monotonic() + 120
         exported = None
         while time.monotonic() < deadline and not exported:

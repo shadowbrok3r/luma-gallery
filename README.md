@@ -22,7 +22,9 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
 - LibVLC demuxing handles Sony MP4 with PCM audio. Android hardware decoding feeds a GPU
   SurfaceTexture directly; no full-frame readback or egui pixel uploads during playback.
 - Scrub-preview loupe, 5x/20x fine seeking by lifting the drag, timeline zoom, frame steps,
-  playback speed, mute, in/out marks and selection looping.
+  playback speed, mute, in/out marks and selection looping. Speed, loop and sound share a row
+  with the resolution and frame rate; play, frame steps and previous/next sit on the bottom row.
+  Settings > Playback controls puts both on the right (default), left or center.
 - Fast trims copy the video from the preceding keyframe and encode audio to AAC. Exact trims
   re-encode with x264 CRF 18. Both create new files under `Movies/Luma`; originals are untouched.
 - Photo editor: draggable crop, aspect presets, rotate, mirror, exposure, contrast and color.
@@ -31,10 +33,19 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
 - Video editing: numeric in/out seconds, draggable trim handles, crop presets and a separate
   audio waveform aligned with the frame strip, playhead and timeline zoom. Crop uses Exact
   cut; exports can retain or omit audio. These tools also work on non-Sony recordings.
-- **Edit video** (pencil in the viewer, or the More menu) opens a multi-layer editor. The video
-  track splits at the playhead; deleting a part ripples later captions with it. Segments fade in
-  and out through black or white, and a cut can dip to black. Playback skips removed parts.
-- **Video** (or the + tile after the last clip) adds another library video to the track, at the
+- **Edit video** (pencil in the viewer, or the More menu) opens a multi-layer editor. Playback
+  (start, frame back, play, frame forward, end) sits under the timeline on the Settings side, and
+  tools are grouped under Video, Text, Overlay and Canvas tabs; selecting a clip opens its tab.
+  The video track splits at the playhead; deleting a part ripples later captions with it.
+  Segments fade in and out through black or white, and a cut can dip to black. Playback skips
+  removed parts.
+- **Speed** plays a segment from 0.25x to 4x with the sound's pitch kept, in the preview and the
+  export; captions and overlays over the segment stretch with it and later ones move.
+- **Adjust** grades a segment with exposure, brightness, contrast, highlights, shadows, whites,
+  blacks, temperature, tint, vibrance and saturation. White balance and exposure scale linear
+  light and tone works in stops around middle grey, as RAW developers do. The preview applies
+  the same 33-point color table on the GPU that the export applies with FFmpeg's lut3d at 16 bits.
+- **Add video** (or the + tile after the last clip) adds another library video to the track, at the
   cut nearest the playhead or at the end. Other sizes and rotations are letterboxed into the
   first video's frame; each clip keeps its own audio, and silent clips play silence.
 - **Captions** transcribes the timeline's audio on the phone with whisper.cpp (base model; 57 MB
@@ -101,6 +112,9 @@ cargo test --lib
 ```
 
 UI regression: `python3 scripts/smoke-android.py --serial emulator-5554`.
+The scripts set `debug.luma.automation` to 1, so the app logs its icon controls, timeline lanes
+and video frame with pixel bounds on `LumaWidgets` logcat lines; scripts tap those by label and
+fall back to measured coordinates.
 Photo navigation/theme regression: `python3 scripts/smoke-navigation.py --serial emulator-5554`.
 DNG viewer regression: `python3 scripts/smoke-dng.py --serial emulator-5554`.
 Continuous album scroll regression: `python3 scripts/smoke-scroll.py --serial emulator-5554`.
@@ -163,7 +177,9 @@ The video editor joins videos on one track; it does not place video picture-in-p
 preview switches files at a cut between videos with a short pause, and volume and audio fades
 are heard only in the export. Speech recognition uses whisper's base model: word times come
 from its token timestamps and are usually within a tenth of a second; there is no speaker
-separation, and editing the timeline after transcribing needs a new transcription. Color emoji render from bitmap (CBDT/sbix) emoji fonts;
+separation, and editing the timeline after transcribing needs a new transcription. Slowed
+segments repeat frames; there is no frame interpolation. Adjust works on the decoded SDR
+picture; HDR, log and RAW video are not developed from their wider range yet. Color emoji render from bitmap (CBDT/sbix) emoji fonts;
 COLRv1-only emoji fonts, such as the Android 16 emulator's, fall back to monochrome Noto Emoji.
 Editor exports re-encode with x264 and use the cropped source size or a 1080p/720p limit.
 

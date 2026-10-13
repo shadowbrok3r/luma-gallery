@@ -1,5 +1,42 @@
 # Verification
 
+## Speed, Adjust and One-Handed Layout Release 0.1.16 (2026-10-13)
+
+Segments carry `speed` (0.25–4) and `color` (`color::Adjust`); projects saved before default to
+1x and no adjustment. A segment's timeline length is its source range divided by its speed, and
+every timeline/source conversion goes through `Segment::timeline` and `Segment::source`. Exports
+use `setpts=(PTS-STARTPTS)/speed`, `fps` at the project rate and `atempo` steps within 0.5–2.
+Color adjustments become a 33-point table: `lut3d` at gbrp16le in FFmpeg (now built with that
+filter, marker `ffmpeg-studio-v3-ready`) and a 1089x33 strip sampled in the video shader of
+EguiMobile 3677b26 (`GpuVideoSurface::set_lut`).
+
+- Crash: Remove captions deleted the layer and then indexed it again in the same frame
+  (`index out of bounds: the len is 1 but the index is 1` when captions were on top). A
+  regression test taps the button by its accessibility label; it panics with the old code.
+- 91 host tests pass, including speed mapping, splits and trims at 2x, overlays stretching with
+  a speed change, `atempo` chains, a desktop render of 2x/1x/0.5x segments (7.00 s, colors at
+  the expected times), every color control keeping grey ramps monotonic, the .cube and GPU
+  strip sampling one grid, a desktop `lut3d` export matching `Adjust::apply` within 0.035, and
+  editor tests for the playback row position and alignment, tool groups following the selection
+  without scrolling, and the Speed and Adjust panels.
+- Emulator, 2x segment: the timeline became 5.5 s; after playing from the start, the source
+  timecode burned into the clip read 3.433 s at an editor time of 1.730 s and 3.467 s at 1.718 s.
+  Before pausing settled on the extrapolated clock, LibVLC's stale clock left 1.826 s on screen
+  while the frame showed 4.033 s.
+- Emulator, Adjust: +1.02 EV and +51 temperature turned the clip's grey box from (129,128,129)
+  to (186,175,167) on the stage; the math gives (187,175,167). The emulator export was 5.50 s of
+  video and audio, and the same box read (183,173,163) at 1.718 s, which showed source 3.467 s.
+- Viewer: Export clip no longer shares a row with the resolution and frame rate; playback rows
+  are right-aligned, or left/center from Settings, in portrait. The landscape editor puts the
+  playback row under the stage and the tool tabs under the timeline.
+- Smoke scripts now tap icon controls by label from `LumaWidgets` log lines
+  (`debug.luma.automation=1`) with measured fallbacks. `smoke-studio.py` (7 checks),
+  `smoke-captions.py` (5), `smoke-multivideo.py` (8, twice), `smoke-export.py` and
+  `smoke-share.py` pass. `smoke-playback.py` fails at "play at end restarts" and
+  `smoke-crop.py` at its photo crop release, and both fail the same way with the earlier
+  emulator build and the scripts as committed. `smoke-video-frames.py` still cannot OCR the
+  loupe's time label, although the loupe shows the right frame and time.
+
 ## TikTok Sans (0.1.15, 2026-10-13)
 
 `fonts/TikTokSans.ttf` (google/fonts 1e1dba1d, OFL-1.1) is compiled into the library. Its axes

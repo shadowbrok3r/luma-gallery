@@ -83,6 +83,7 @@ final class GalleryController {
     private long loopStart, loopEnd;
     private long[] rangeIn = new long[0], rangeOut = new long[0];
     private int[] rangeSource = new int[0];
+    private float[] rangeSpeed = new float[0];
     private String[] sourceUris = new String[0];
     /** Edit segment being shown, and the uri of the media in the player. */
     private int segment;
@@ -152,10 +153,11 @@ final class GalleryController {
             boolean playing = player.isPlaying() && hold < 0;
             if (playing) {
                 long time = player.getTime(), now = SystemClock.uptimeMillis();
+                float rate = rate();
                 boolean settling = now - jumpAt < 600
-                    && (time < jumpTarget - 100 || time > jumpTarget + 100 + (long)((now - jumpAt) * speed));
+                    && (time < jumpTarget - 100 || time > jumpTarget + 100 + (long)((now - jumpAt) * rate));
                 if (time != clockTime) { clockTime = time; clockAt = now; }
-                long at = clockTime + (long)(Math.min(400, now - clockAt) * speed);
+                long at = clockTime + (long)(Math.min(400, now - clockAt) * rate);
                 long start = span(true), end = span(false);
                 if (settling) { }
                 else if (rangeIn.length > 0) follow(at, now);
@@ -176,6 +178,7 @@ final class GalleryController {
         int next = i + 1;
         if (next >= rangeIn.length) { park(Math.max(rangeIn[i], rangeOut[i] - 40)); return; }
         segment = next;
+        applyRate();
         if (!uriOf(next).equals(loadedUri)) load(uriOf(next), rangeIn[next], true);
         else if (Math.abs(rangeIn[next] - rangeOut[i]) > 40) jump(rangeIn[next], now);
     }
@@ -185,6 +188,14 @@ final class GalleryController {
         player.setTime(time, false);
         clockTime = -1; finished = true;
     }
+
+    /** The edit segment's speed while editing, else the viewer's playback speed. */
+    private float rate() {
+        if (rangeIn.length == 0) return speed;
+        return segment < rangeSpeed.length ? rangeSpeed[segment] : 1f;
+    }
+
+    private void applyRate() { if (player != null) player.setRate(rate()); }
 
     private String uriOf(int index) {
         int source = index < rangeSource.length ? rangeSource[index] : 0;
@@ -249,14 +260,14 @@ final class GalleryController {
                             stageVisible = data.optBoolean("visible", true); layoutStage(); break;
                         case "play": togglePlay(data.optBoolean("playing", true)); break;
                         case "seek": seek(Math.max(0, data.getLong("time")), data.optBoolean("fast", false), data.optInt("segment", -1)); break;
-                        case "segments": ranges(data.optJSONArray("ranges"), data.optJSONArray("sources")); break;
+                        case "segments": ranges(data.optJSONArray("ranges"), data.optJSONArray("sources"), data.optJSONArray("speeds")); break;
                         case "probe": probe(data.getJSONObject("item")); break;
                         case "studio_export": studioExport(data); break;
                         case "transcribe": speech.run(data); break;
                         case "cancel_transcribe": speech.cancel(); break;
                         case "speech_model_delete": speech.deleteModel(); break;
                         case "mute": muted = data.getBoolean("muted"); if (player != null && hold < 0) player.setVolume(muted ? 0 : 100); break;
-                        case "rate": speed = (float)data.getDouble("rate"); if (player != null) player.setRate(speed); break;
+                        case "rate": speed = (float)data.getDouble("rate"); applyRate(); break;
                         case "loop": loop = data.getBoolean("enabled"); loopStart = data.optLong("start"); loopEnd = data.optLong("end"); break;
                         case "preview": showPreview(data); break;
                         case "preview_end": endPreview(); break;
@@ -479,6 +490,7 @@ final class GalleryController {
                     if (pauses > 0) pauses--;
                     else if (segment + 1 < rangeIn.length) {
                         segment++;
+                        applyRate();
                         if (!uriOf(segment).equals(loadedUri)) load(uriOf(segment), rangeIn[segment], true);
                         else { jump(rangeIn[segment], SystemClock.uptimeMillis()); player.play(); }
                     }
@@ -493,7 +505,7 @@ final class GalleryController {
                 if (event.type == MediaPlayer.Event.EndReached && rangeIn.length == 0 && loop && loopEnd > loopStart) reopen(loopStart, true);
             });
             attach(source); loadedUri = item.getString("uri");
-            player.setVolume(muted ? 0 : 100); player.setRate(speed);
+            player.setVolume(muted ? 0 : 100); applyRate();
             layoutStage(); togglePlay(true);
             main.removeCallbacks(rangeWatch); main.post(rangeWatch);
             io.execute(() -> {
@@ -587,7 +599,14 @@ final class GalleryController {
             // An opening input is paused from its Playing event.
             if (hold >= 0) return;
             if (player.getPlayerState() == IMedia.State.Opening) { hold = Math.max(0, position()); player.setVolume(0); }
-            else pausePlayer();
+            else {
+                // Moves a paused sped-up edit segment to its extrapolated clock time.
+                long now = SystemClock.uptimeMillis(), time = player.getTime();
+                boolean sped = rangeIn.length > 0 && Math.abs(rate() - 1f) > 0.01f;
+                long at = sped && clockTime >= 0 && player.isPlaying() ? clockTime + (long)(Math.min(400, now - clockAt) * rate()) : -1;
+                pausePlayer();
+                if (at > time + 40) { player.setTime(at, false); jumpTarget = at; jumpAt = now; }
+            }
             return;
         }
         if (audio.requestAudioFocus(focus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return;
@@ -605,6 +624,7 @@ final class GalleryController {
         if (player == null) return;
         if (index >= 0 && index < rangeIn.length) {
             segment = index;
+            applyRate();
             if (!uriOf(index).equals(loadedUri)) { load(uriOf(index), time, player.isPlaying() && hold < 0); return; }
         }
         long length = player.getLength();
@@ -700,7 +720,7 @@ final class GalleryController {
         if (photo != null) { photo.close(); photo = null; }
         if (source != null) try { source.close(); } catch (Exception ignored) { }
         source = null; selected = null; loop = false; playbackError = ""; photoStatus = "";
-        rangeIn = new long[0]; rangeOut = new long[0]; rangeSource = new int[0]; sourceUris = new String[0];
+        rangeIn = new long[0]; rangeOut = new long[0]; rangeSource = new int[0]; rangeSpeed = new float[0]; sourceUris = new String[0];
         segment = 0; loadedUri = ""; hold = -1; main.removeCallbacks(rangeWatch);
         audio.abandonAudioFocusRequest(focus);
         activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -783,18 +803,21 @@ final class GalleryController {
         });
     }
 
-    private void ranges(JSONArray ranges, JSONArray sources) throws JSONException {
+    private void ranges(JSONArray ranges, JSONArray sources, JSONArray speeds) throws JSONException {
         int count = ranges == null ? 0 : ranges.length();
         long[] in = new long[count], out = new long[count];
         int[] from = new int[count];
+        float[] rates = new float[count];
         for (int i = 0; i < count; i++) {
             JSONArray range = ranges.getJSONArray(i);
             in[i] = range.getLong(0); out[i] = range.getLong(1); from[i] = range.optInt(2, 0);
+            rates[i] = speeds == null ? 1f : (float) speeds.optDouble(i, 1);
         }
         String[] uris = new String[sources == null ? 0 : sources.length()];
         for (int i = 0; i < uris.length; i++) uris[i] = sources.getString(i);
-        rangeIn = in; rangeOut = out; rangeSource = from; sourceUris = uris; clockTime = -1;
+        rangeIn = in; rangeOut = out; rangeSource = from; rangeSpeed = rates; sourceUris = uris; clockTime = -1;
         segment = Math.min(segment, Math.max(0, count - 1));
+        applyRate();
         String primary = selected == null ? "" : selected.optString("uri");
         if (count == 0 && player != null && !primary.isEmpty() && !loadedUri.equals(primary)) load(primary, 0, false);
     }

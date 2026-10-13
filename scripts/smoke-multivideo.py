@@ -9,8 +9,9 @@ modification times are set ahead of the library so they lead the editor's video 
 Opens the main clip in the editor, adds the portrait clip before it and the silent clip
 after it, plays across the first cut, reopens the editor and exports. The export in
 Movies/Luma is checked without the UI: duration, size, letterboxing, the order of the
-pictures and each section's audio. Control coordinates were verified with ADB screenshots
-on this AVD. Never deletes media.
+pictures and each section's audio. Controls and picker tiles are found by label (LumaWidgets
+log) or OCR; coordinates measured with ADB screenshots on this AVD are fallbacks. Never deletes
+media.
 """
 import argparse
 import io
@@ -26,12 +27,8 @@ from PIL import Image
 
 Device = runpy.run_path(str(Path(__file__).with_name("smoke-android.py")))["Device"]
 FOLDER = "/sdcard/DCIM/Luma-Multi"
-TOOL_Y = 2840
-VIDEO_TOOL = (801, TOOL_Y)
-PLAY = (760, 2096)
-FIRST_TILE = (226, 2060)
-SECOND_TILE = (552, 2060)
-EMPTY_STAGE = (1250, 1650)
+FIRST_TILE = (226, 1910)
+SECOND_TILE = (552, 1910)
 
 
 def run(*args):
@@ -50,8 +47,20 @@ def tone(samples, start, seconds=0.5):
     return round(np.fft.rfftfreq(len(part), 1 / 8000)[spectrum.argmax()]), np.sqrt((part ** 2).mean())
 
 
+def film_y(d):
+    top, bottom = d.bounds("Film", [42, 2040, 1398, 2236])[1::2]
+    return str((top + bottom) // 2)
+
+
+def stage_center(d):
+    left, top, right, bottom = d.bounds("Video frame", [56, 671, 1384, 1418])
+    return (left + right) // 2, (top + bottom) // 2
+
+
 def times(d):
-    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, 2040, 700, 2150))))
+    """Editor time and length from the playback row, left of its buttons."""
+    left, top, _, bottom = d.bounds("Go to start", [621, 2427, 761, 2567])
+    text = " ".join(row[0] for row in d.lines(d.screen().crop((0, top - 20, left, bottom + 20))))
     found = [int(m[0]) * 60000 + int(m[1]) * 1000 + int(m[2] or 0) for m in re.findall(r"(\d{2}):(\d{2})(?:[.,](\d{3}))?", text)]
     assert len(found) == 2, "No playhead and length: " + text
     return found
@@ -61,17 +70,19 @@ def scrub(d, direction):
     """Drags the timeline twice across the screen, far enough to reach either end."""
     for _ in range(2):
         start, end = (1300, 220) if direction > 0 else (220, 1300)  # The track starts right of x=175.
-        d.adb("shell", "input", "swipe", str(start), "2500", str(end), "2500", "400")
+        y = film_y(d)
+        d.adb("shell", "input", "swipe", str(start), y, str(end), y, "400")
     time.sleep(1.2)
 
 
-def pick(d, tile, label):
-    d.tap(*VIDEO_TOOL)
-    d.wait_text("Add video")
+def pick(d, name, tile, label):
+    d.tap_icon("Add video", (155, 2696))
+    d.wait_text("Adds the whole video")
     d.screen(f"picker-{label}")
-    d.tap(*tile)
+    d.tap_icon(name, tile)
     time.sleep(2.5)
-    d.tap(*EMPTY_STAGE)
+    left, top, right, bottom = d.bounds("Video frame", [56, 671, 1384, 1418])
+    d.tap(right - 134, bottom + 50)  # Empty stage deselects.
     time.sleep(0.8)
 
 
@@ -109,48 +120,50 @@ def main(args):
         d.shell("am", "start", "-a", "android.intent.action.VIEW", "-d", f"file://{FOLDER}/{main_name}",
                 "-t", "video/mp4", "-n", "app.luma.gallery/.GalleryActivity")
         d.wait_text("Export clip")
-        d.tap(433, 2715)  # Pause.
-        d.tap(431, 2867)  # Edit video.
+        d.tap_icon("Pause", (999, 2868))
+        d.tap_icon("Edit video", (434, 2714))
         d.wait_text("Edit video")
 
-        pick(d, FIRST_TILE, "portrait")
+        pick(d, portrait, FIRST_TILE, "portrait")
         assert times(d) == [0, 10_000], times(d)
+        x, y = stage_center(d)
         shot = np.asarray(d.screen("portrait-first"), np.int16)
-        assert shot[1100, 300].max() < 30 and shot[1100, 720].max() > 120, "Portrait clip letterboxed at the start"
+        assert shot[y, 300].max() < 30 and shot[y, x].max() > 120, "Portrait clip letterboxed at the start"
         d.checks.append("portrait-inserted-before")
 
         scrub(d, 1)
         at, length = times(d)
         assert length == 10_000 and at >= 9900, (at, length)
-        pick(d, SECOND_TILE, "silent")
+        pick(d, silent, SECOND_TILE, "silent")
         assert times(d)[1] == 13_000, times(d)
         d.checks.append("silent-appended")
 
         scrub(d, -1)
-        d.adb("shell", "input", "swipe", "900", "2500", "650", "2500", "500")
+        y = film_y(d)
+        d.adb("shell", "input", "swipe", "900", y, "650", y, "500")
         time.sleep(1.2)
         start = times(d)[0]
         assert 500 < start < 3800, start
-        d.tap(*PLAY)
+        d.tap_icon("Play", (999, 2497))
         time.sleep(3.0)
-        d.tap(*PLAY)
+        d.tap_icon("Pause", (999, 2497))
         time.sleep(1.0)
         at = times(d)[0]
+        x, y = stage_center(d)
         shot = np.asarray(d.screen("played-across-cut"), np.int16)
         assert at > 4300 and at - start > 2000, (start, at)
-        assert shot[1100, 300].max() > 120, "Main video fills the canvas after the cut"
+        assert shot[y, 300].max() > 120, "Main video fills the canvas after the cut"
         d.checks.append(f"played-{start}-to-{at}-across-cut")
 
         d.shell("input", "keyevent", "4")  # Closes the editor.
         d.wait_text("Export clip")
-        d.tap(431, 2867)
+        d.tap_icon("Edit video", (434, 2714))
         d.wait_text("Edit video")
         assert times(d)[1] == 13_000, "Project restored: " + str(times(d))
         d.checks.append("project-restored")
 
         d.tap(1229, 229)  # Export header button.
-        d.wait_text("Export video")
-        d.tap(384, 2371)
+        d.tap_text("Export video", (384, 2220))
         deadline = time.monotonic() + 150
         exported = None
         while time.monotonic() < deadline and not exported:

@@ -15,7 +15,8 @@ const RULER: f32 = 20.0;
 const LANE: f32 = 34.0;
 const FILM: f32 = 56.0;
 const TOOLS: f32 = 62.0;
-const TRANSPORT: f32 = 40.0;
+const TRANSPORT: f32 = 44.0;
+const GROUPS: f32 = 34.0;
 const SWATCHES: [[u8; 4]; 10] = [
     [255, 255, 255, 255],
     [0, 0, 0, 255],
@@ -43,7 +44,18 @@ pub(super) enum Panel {
     Photos,
     Videos,
     Captions,
+    Speed,
+    Adjust,
     Debug,
+}
+
+/// Tool groups along the bottom of the editor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Group {
+    Video,
+    Text,
+    Overlay,
+    Canvas,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -118,7 +130,12 @@ pub(super) struct Studio {
     shadow: Project,
     changed: f64,
     pub pick: Option<Pick>,
+    /// Selection the tool group last followed.
+    last_pick: Option<Pick>,
+    pub group: Group,
     pub panel: Panel,
+    /// Shows the video without color adjustments while held.
+    before: bool,
     pub playhead: i64,
     scale: f32,
     rows: f32,
@@ -159,8 +176,8 @@ pub(super) struct Studio {
     renders: u32,
     /// Words recognized from the timeline's audio, saved beside the project and outside undo.
     transcript: Option<Transcript>,
-    /// Timeline ranges of the transcription in progress.
-    heard: Option<Vec<[i64; 3]>>,
+    /// Timeline ranges and speeds of the transcription in progress.
+    heard: Option<(Vec<[i64; 3]>, Vec<f32>)>,
     speech_error: String,
     language: String,
     caption_mode: CaptionMode,
@@ -210,7 +227,10 @@ impl Studio {
             changed: 0.0,
             project,
             pick: None,
+            last_pick: None,
+            group: Group::Video,
             panel: Panel::None,
+            before: false,
             playhead: 0,
             scale: 0.0,
             rows: f32::MAX,
@@ -316,8 +336,10 @@ impl Studio {
                 let path = e["path"].as_str().unwrap_or_default();
                 match std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| speech::parse(&bytes)) {
                     Ok(transcript) => {
+                        let (ranges, speeds) = self.heard.take().unwrap_or_else(|| (self.project.ranges(), self.project.speeds()));
                         self.transcript = Some(Transcript {
-                            ranges: self.heard.take().unwrap_or_else(|| self.project.ranges()),
+                            ranges,
+                            speeds,
                             ..transcript
                         });
                         self.speech_error.clear();
@@ -613,6 +635,14 @@ impl Studio {
         self.focus_text = true;
     }
 
+    /// The selected segment, else the one under the playhead.
+    fn segment_index(&self) -> usize {
+        match self.pick {
+            Some(Pick::Segment(i)) if i < self.project.segments.len() => i,
+            _ => self.project.locate(self.playhead).map_or(0, |(i, _)| i),
+        }
+    }
+
     /// Three seconds from the playhead, kept inside the video when it is long enough.
     fn slot(&self) -> (i64, i64) {
         let length = self.project.length();
@@ -710,6 +740,21 @@ impl Studio {
         self.project.set_captions(clips);
     }
 
+    /// Deletes the caption layer and its previews, clearing a selection inside it.
+    fn remove_captions(&mut self) {
+        let Some(l) = self.project.caption_layer() else {
+            return;
+        };
+        let removed = self.project.layers.remove(l);
+        for clip in &removed.clips {
+            self.previews.remove(&clip.id);
+        }
+        if removed.clips.iter().any(|c| self.pick == Some(Pick::Clip(c.id))) {
+            self.pick = None;
+        }
+        self.follow = None;
+    }
+
     /// Applies `change` to every clip of the caption layer.
     fn restyle_captions(&mut self, change: impl Fn(&mut Clip)) {
         if let Some(l) = self.project.caption_layer() {
@@ -735,6 +780,7 @@ impl Studio {
                 })
                 .collect(),
             ranges: self.project.ranges(),
+            speeds: self.project.speeds(),
         });
         self.save_transcript();
     }
@@ -780,6 +826,12 @@ fn haptic_tick(s: &mut Studio, snapped: bool, axis: usize) {
         s.haptic = Some(egui_mobile::Haptic::Selection);
     }
     s.guides[axis] = snapped;
+}
+
+/// Speed as shown on clips and buttons, such as "0.5x" or "2x".
+fn speed_label(speed: f64) -> String {
+    let text = format!("{speed:.2}");
+    format!("{}x", text.trim_end_matches('0').trim_end_matches('.'))
 }
 
 fn rgb(c: [u8; 3], alpha: f32) -> Color32 {
@@ -918,6 +970,35 @@ fn panel_title(ui: &mut egui::Ui, title: &str) -> bool {
     done
 }
 
+/// Start, previous frame, play, next frame and end, left to right.
+fn transport_buttons(s: &mut Studio, ui: &mut egui::Ui, playing: bool) {
+    ui.spacing_mut().item_spacing.x = 4.0;
+    let frame = (1000.0 / s.project.fps.max(1.0)).round() as i64;
+    let length = s.project.length();
+    let pause = || bridge::send(json!({"op":"play","playing":false}));
+    if icons::button(ui, "previous", "Go to start", false).clicked() {
+        s.seek(0, false);
+    }
+    if icons::button(ui, "step_back", "Previous frame", false).clicked() {
+        pause();
+        s.seek(s.playhead - frame, false);
+    }
+    if icons::button(ui, if playing { "pause" } else { "play" }, if playing { "Pause" } else { "Play" }, true).clicked() {
+        if !playing && s.playhead >= length - 60 {
+            s.seek(0, false);
+        }
+        bridge::send(json!({"op":"play","playing":!playing}));
+    }
+    if icons::button(ui, "step_forward", "Next frame", false).clicked() {
+        pause();
+        s.seek(s.playhead + frame, false);
+    }
+    if icons::button(ui, "next", "Go to end", false).clicked() {
+        pause();
+        s.seek((length - frame).max(0), false);
+    }
+}
+
 /// Equal-width icon tools in a horizontal strip; returns the tapped index.
 fn tool_strip(ui: &mut egui::Ui, tools: &[(&str, &str, bool)]) -> Option<usize> {
     let mut tapped = None;
@@ -954,6 +1035,9 @@ fn tool_strip(ui: &mut egui::Ui, tools: &[(&str, &str, bool)]) -> Option<usize> 
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
                     });
+                    if enabled {
+                        icons::note(ui, label, rect);
+                    }
                     if response.clicked() {
                         tapped = Some(n);
                     }
@@ -997,6 +1081,7 @@ impl Gallery {
 
     pub(super) fn close_studio(&mut self, studio: Studio) {
         studio.save();
+        self.grade(crate::color::Adjust::default());
         bridge::send(json!({"op":"segments","ranges":[]}));
         bridge::send(json!({"op":"play","playing":false}));
         self.last_rect = None;
@@ -1034,7 +1119,7 @@ impl Gallery {
 
     fn studio_sync(&mut self, s: &mut Studio) {
         let sources: Vec<&str> = s.project.sources.iter().map(|v| v.uri.as_str()).collect();
-        let edit = json!({"op":"segments","ranges":s.project.ranges(),"sources":sources});
+        let edit = json!({"op":"segments","ranges":s.project.ranges(),"sources":sources,"speeds":s.project.speeds()});
         if s.sent.as_ref() != Some(&edit) {
             bridge::send(edit.clone());
             s.sent = Some(edit);
@@ -1059,9 +1144,9 @@ impl Gallery {
                     if s.reported.is_none_or(|(value, _)| value != t) {
                         s.reported = Some((t, Instant::now()));
                     }
+                    // Timeline time advances with the clock at any segment speed.
                     let (value, at) = s.reported.expect("set above");
-                    let rate = playback["rate"].as_f64().unwrap_or(1.0);
-                    let ahead = (at.elapsed().as_millis().min(400) as f64 * rate) as i64;
+                    let ahead = at.elapsed().as_millis().min(400) as i64;
                     s.playhead = (value + ahead).min(s.project.length());
                 } else {
                     s.reported = None;
@@ -1131,20 +1216,20 @@ impl Gallery {
                 self.studio_stage(s, &mut columns[0], vec2(left.x, left.y - TRANSPORT - spacing));
                 self.studio_transport(s, &mut columns[0]);
                 let right = columns[1].available_size();
-                self.studio_lower(s, &mut columns[1], right, host);
+                self.studio_lower(s, &mut columns[1], right, host, false);
             });
         } else {
             let lanes = RULER + 28.0 + s.project.layers.len() as f32 * (LANE + 2.0) + FILM;
             let lower = match s.panel {
-                Panel::None => lanes.clamp(150.0, (available.y * 0.42).max(150.0)) + TOOLS,
+                Panel::None => lanes.clamp(150.0, (available.y * 0.42).max(150.0)) + TOOLS + GROUPS + spacing * 2.0,
                 Panel::Text => (available.y * 0.36).clamp(150.0, 240.0),
                 _ => (available.y * 0.48).clamp(190.0, 420.0),
-            };
-            let stage = (available.y - lower - TRANSPORT - spacing * 3.0).max(90.0);
+            } + TRANSPORT
+                + spacing;
+            let stage = (available.y - lower - spacing).max(90.0);
             self.studio_stage(s, ui, vec2(available.x, stage));
-            self.studio_transport(s, ui);
             let rest = ui.available_size();
-            self.studio_lower(s, ui, rest, host);
+            self.studio_lower(s, ui, rest, host, true);
         }
         if let Some(before) = s.follow.take()
             && s.clip().is_some_and(|c| c.id == before.id && *c != before)
@@ -1160,55 +1245,76 @@ impl Gallery {
         close
     }
 
-    fn studio_lower(&mut self, s: &mut Studio, ui: &mut egui::Ui, size: Vec2, host: &Host) {
+    /// Timeline or open panel, then playback below it when `transport`, then tools when no panel is open.
+    fn studio_lower(&mut self, s: &mut Studio, ui: &mut egui::Ui, size: Vec2, host: &Host, transport: bool) {
+        let spacing = ui.spacing().item_spacing.y;
+        let bar = if transport { TRANSPORT + spacing } else { 0.0 };
         if s.panel == Panel::None {
-            self.studio_timeline(s, ui, vec2(size.x, (size.y - TOOLS - 4.0).max(80.0)));
+            self.studio_timeline(s, ui, vec2(size.x, (size.y - bar - TOOLS - GROUPS - spacing * 2.0).max(80.0)));
+            if transport {
+                self.studio_transport(s, ui);
+            }
             self.studio_tools(s, ui);
+            self.studio_groups(s, ui);
         } else {
+            let height = size.y - bar;
             egui::Frame::new()
                 .fill(PANEL)
                 .corner_radius(8)
                 .inner_margin(8)
                 .show(ui, |ui| {
-                    ui.set_min_size(vec2(size.x - 16.0, size.y - 16.0));
-                    ui.set_max_height(size.y - 16.0);
+                    ui.set_min_size(vec2(size.x - 16.0, height - 16.0));
+                    ui.set_max_height(height - 16.0);
                     self.studio_panel(s, ui, host);
                 });
+            if transport {
+                self.studio_transport(s, ui);
+            }
         }
     }
 
     fn studio_transport(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        let (hand, playing) = (self.layout.hand, self.playing());
+        let (now, length) = (timecode(s.playhead, true), format!("/ {}", timecode(s.project.length(), false)));
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), TRANSPORT),
             egui::Layout::left_to_right(Align::Center),
             |ui| {
-                ui.label(egui::RichText::new(timecode(s.playhead, true)).size(14.0).color(TEXT));
-                ui.label(
-                    egui::RichText::new(format!("/ {}", timecode(s.project.length(), false)))
-                        .size(12.0)
-                        .color(MUTED),
-                );
-                let playing = self.playing();
-                let middle = (ui.available_width() / 2.0 - 64.0).max(0.0);
-                ui.add_space(middle);
-                if icons::button(ui, if playing { "pause" } else { "play" }, if playing { "Pause" } else { "Play" }, true)
-                    .clicked()
-                {
-                    if !playing && s.playhead >= s.project.length() - 60 {
-                        s.seek(0, false);
-                    }
-                    bridge::send(json!({"op":"play","playing":!playing}));
+                if hand == Hand::Left {
+                    transport_buttons(s, ui, playing);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(egui::RichText::new(length).size(12.0).color(MUTED));
+                        ui.label(egui::RichText::new(now).size(14.0).color(TEXT));
+                    });
+                } else {
+                    ui.label(egui::RichText::new(now).size(14.0).color(TEXT));
+                    ui.label(egui::RichText::new(length).size(12.0).color(MUTED));
+                    handed(ui, hand, "studio_transport", |ui| transport_buttons(s, ui, playing));
                 }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if icons::button(ui, "zoom_in", "Zoom timeline in", false).clicked() {
-                        s.scale = (s.scale * 1.6).min(900.0);
-                    }
-                    if icons::button(ui, "zoom_out", "Zoom timeline out", false).clicked() {
-                        s.scale = (s.scale / 1.6).max(6.0);
-                    }
-                });
             },
         );
+    }
+
+    /// Category tabs under the tools.
+    fn studio_groups(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        let groups = [(Group::Video, "Video"), (Group::Text, "Text"), (Group::Overlay, "Overlay"), (Group::Canvas, "Canvas")];
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), GROUPS), Sense::hover());
+        let width = bar.width() / groups.len() as f32;
+        for (n, (group, label)) in groups.into_iter().enumerate() {
+            let rect = Rect::from_min_size(bar.min + vec2(n as f32 * width, 0.0), vec2(width, GROUPS));
+            let response = ui.interact(rect, ui.id().with(("group", label)), Sense::click());
+            let active = s.group == group;
+            let color = if active { ACCENT } else if response.is_pointer_button_down_on() { TEXT } else { MUTED };
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), color);
+            if active {
+                ui.painter().hline(rect.center().x - 20.0..=rect.center().x + 20.0, rect.top() + 2.0, Stroke::new(2.0, ACCENT));
+            }
+            response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, label));
+            icons::note(ui, label, rect);
+            if response.clicked() {
+                s.group = group;
+            }
+        }
     }
 
     fn studio_stage(&mut self, s: &mut Studio, ui: &mut egui::Ui, size: Vec2) {
@@ -1229,7 +1335,14 @@ impl Gallery {
         );
         let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(frame));
         clipped.set_clip_rect(frame.intersect(stage));
+        icons::note(ui, "Video frame", frame);
         ui.painter().rect_filled(frame, 0, PANEL);
+        let showing = self.native["playback"]["segment"]
+            .as_u64()
+            .map(|i| i as usize)
+            .or_else(|| s.project.locate(s.playhead).map(|(i, _)| i));
+        let color = showing.and_then(|i| s.project.segments.get(i)).filter(|_| !s.before).map(|segment| segment.color);
+        self.grade(color.unwrap_or_default());
         #[cfg(target_os = "android")]
         {
             let playback = &self.native["playback"];
@@ -1515,6 +1628,17 @@ impl Gallery {
 
     fn studio_timeline(&mut self, s: &mut Studio, ui: &mut egui::Ui, size: Vec2) {
         let (area, _) = ui.allocate_exact_size(size, Sense::hover());
+        for (n, (icon, label, factor)) in [("zoom_out", "Zoom timeline out", 1.0 / 1.6), ("zoom_in", "Zoom timeline in", 1.6)].into_iter().enumerate() {
+            let rect = Rect::from_min_size(area.min + vec2(n as f32 * HEADER / 2.0, 0.0), vec2(HEADER / 2.0, RULER)).shrink(1.5);
+            let response = ui.interact(rect, ui.id().with(label), Sense::click());
+            ui.painter().rect_filled(rect, 4, Color32::from_white_alpha(if response.is_pointer_button_down_on() { 45 } else { 16 }));
+            icons::image(icon, TEXT, 14.0).paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(14.0)));
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+            icons::note(ui, label, rect);
+            if response.clicked() {
+                s.scale = (s.scale * factor).clamp(6.0, 900.0);
+            }
+        }
         let track = Rect::from_min_max(pos2(area.left() + HEADER, area.top()), area.max);
         let length = s.project.length();
         if s.scale <= 0.0 {
@@ -1548,6 +1672,14 @@ impl Gallery {
         lanes.push((Lane::Film, Rect::from_min_size(pos2(area.left(), y), vec2(area.width(), FILM))));
         s.track = track;
         s.lanes = lanes.clone();
+        icons::note(ui, "Timeline", track);
+        for (lane, rect) in &lanes {
+            let label = match lane {
+                Lane::Film => "Film".to_owned(),
+                Lane::Layer(l) => format!("Layer {l}"),
+            };
+            icons::note(ui, &label, rect.intersect(Rect::from_min_max(pos2(area.left(), area.top() + RULER), area.max)));
+        }
         let body = Rect::from_min_max(pos2(area.left(), area.top() + RULER), area.max);
         let painter = ui.painter().with_clip_rect(body);
         let track_painter = ui.painter().with_clip_rect(track.intersect(body));
@@ -1631,7 +1763,7 @@ impl Gallery {
                             }
                             let tile_rect = Rect::from_min_size(pos2(x0 + k as f32 * tile, r.top()), vec2(tile, r.height()));
                             let duration = s.project.sources.get(segment.source).map_or(0, |v| v.duration);
-                            let source = ((segment.source_in + at) / 100 * 100).min((duration - 100).max(0));
+                            let source = ((segment.source_in + segment.source(at)) / 100 * 100).min((duration - 100).max(0));
                             if let Some(texture) = self.thumb(&s.media(segment.source), source) {
                                 let t = texture.size_vec2();
                                 let factor = (tile / t.x).max(r.height() / t.y);
@@ -1649,8 +1781,9 @@ impl Gallery {
                             let columns = ((x1.min(track.right()) - x0.max(track.left())) / 2.0).max(0.0) as i32;
                             for n in 0..columns {
                                 let x = x0.max(track.left()) + n as f32 * 2.0 + 1.0;
-                                let from = segment.source_in as f64 + ((x - x0) * 1000.0 / scale) as f64;
-                                let peak = peaks.peak(from, from + 2000.0 / scale as f64).sqrt() * 6.5;
+                                let speed = segment.speed();
+                                let from = segment.source_in as f64 + ((x - x0) * 1000.0 / scale) as f64 * speed;
+                                let peak = peaks.peak(from, from + 2000.0 / scale as f64 * speed).sqrt() * 6.5;
                                 film.vline(
                                     x,
                                     wave.center().y - peak..=wave.center().y + peak,
@@ -1679,10 +1812,16 @@ impl Gallery {
                             if picked { Stroke::new(2.0, Color32::WHITE) } else { Stroke::new(1.0, LINE) },
                             StrokeKind::Inside,
                         );
+                        if (segment.speed() - 1.0).abs() > 1e-3 && r.width() > 36.0 {
+                            let label = film.layout_no_wrap(speed_label(segment.speed()), FontId::proportional(10.0), Color32::WHITE);
+                            let tag = Rect::from_min_size(pos2(x0.max(track.left()) + 5.0, wave.top() - label.size().y - 7.0), label.size() + vec2(8.0, 4.0));
+                            film.rect_filled(tag, 4, Color32::from_black_alpha(190));
+                            film.galley(tag.min + vec2(4.0, 2.0), label, Color32::WHITE);
+                        }
                         if let Some((Grab::Cut { index, head, delta }, _)) = s.grab
                             && index == i
                         {
-                            let w = delta.unsigned_abs() as f32 * scale / 1000.0;
+                            let w = segment.timeline(delta.abs()) as f32 * scale / 1000.0;
                             let trimmed = if head == (delta > 0) {
                                 if head {
                                     Rect::from_min_max(r.min, pos2(r.left() + w, r.bottom()))
@@ -1937,10 +2076,11 @@ impl Gallery {
                 Grab::Cut { index, head, .. } => {
                     let segment = &s.project.segments[index];
                     let (floor, ceiling) = s.project.trim_bounds(index);
+                    let (ms, shortest) = (segment.source(ms), segment.source(MIN_CLIP));
                     let delta = if head {
-                        (segment.source_in + ms).clamp(floor, segment.source_out - MIN_CLIP) - segment.source_in
+                        (segment.source_in + ms).clamp(floor, (segment.source_out - shortest).max(floor)) - segment.source_in
                     } else {
-                        (segment.source_out + ms).clamp(segment.source_in + MIN_CLIP, ceiling) - segment.source_out
+                        (segment.source_out + ms).clamp((segment.source_in + shortest).min(ceiling), ceiling) - segment.source_out
                     };
                     s.grab = Some((Grab::Cut { index, head, delta }, origin));
                 }
@@ -1999,40 +2139,52 @@ impl Gallery {
 
     fn studio_tools(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
         ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, LINE));
-        let clip = s.clip().map(|c| c.kind());
-        let tools: Vec<(&str, &str, bool)> = match (s.pick, clip) {
-            (Some(Pick::Clip(_)), Some(kind)) => {
-                let mut tools = vec![];
-                if kind == LayerKind::Text {
-                    tools.push(("edit", "Edit", true));
-                }
-                tools.extend([
-                    ("brush", "Style", true),
-                    ("sparkles", "Animate", true),
-                    ("cut", "Split", true),
-                    ("copy", "Copy", true),
-                    ("delete", "Delete", true),
-                ]);
-                tools
-            }
-            (Some(Pick::Segment(_)), _) => vec![
+        let kind = s.clip().map(Clip::kind);
+        if s.pick != s.last_pick {
+            s.last_pick = s.pick;
+            s.group = match (s.pick, kind) {
+                (Some(Pick::Segment(_)), _) => Group::Video,
+                (Some(Pick::Clip(_)), Some(LayerKind::Text)) => Group::Text,
+                (Some(Pick::Clip(_)), Some(LayerKind::Picture)) => Group::Overlay,
+                _ => s.group,
+            };
+        }
+        let segment = matches!(s.pick, Some(Pick::Segment(_)));
+        let tools: Vec<(&str, &str, bool)> = match s.group {
+            Group::Video if segment => vec![
                 ("cut", "Split", true),
+                ("speed", "Speed", true),
+                ("adjust", "Adjust", true),
                 ("fade", "Fade", true),
                 ("volume", "Audio", true),
                 ("delete", "Delete", s.project.segments.len() > 1),
             ],
-            _ => vec![
+            Group::Video => vec![
+                ("video", "Add video", true),
                 ("cut", "Split", true),
-                ("text", "Text", true),
-                ("captions", "Captions", true),
-                ("video", "Video", true),
-                ("photo", "Overlay", true),
-                ("layers", "Layers", true),
+                ("speed", "Speed", true),
+                ("adjust", "Adjust", true),
                 ("fade", "Fade", true),
                 ("volume", "Audio", true),
-                ("crop", "Canvas", true),
-                ("chip", "Debug", true),
             ],
+            Group::Text if kind == Some(LayerKind::Text) => vec![
+                ("edit", "Edit", true),
+                ("brush", "Style", true),
+                ("sparkles", "Animate", true),
+                ("cut", "Split", true),
+                ("copy", "Copy", true),
+                ("delete", "Delete", true),
+            ],
+            Group::Text => vec![("text", "Add text", true), ("captions", "Captions", true), ("layers", "Layers", true)],
+            Group::Overlay if kind == Some(LayerKind::Picture) => vec![
+                ("brush", "Style", true),
+                ("sparkles", "Animate", true),
+                ("cut", "Split", true),
+                ("copy", "Copy", true),
+                ("delete", "Delete", true),
+            ],
+            Group::Overlay => vec![("photo", "Add photo", true), ("layers", "Layers", true)],
+            Group::Canvas => vec![("crop", "Canvas", true), ("layers", "Layers", true), ("chip", "Debug", true)],
         };
         if let Some(n) = tool_strip(ui, &tools) {
             match tools[n].1 {
@@ -2042,7 +2194,12 @@ impl Gallery {
                 }
                 "Style" => s.panel = Panel::Style,
                 "Animate" => s.panel = Panel::Motion,
-                "Split" => s.split(),
+                "Split" => {
+                    if s.group == Group::Video && matches!(s.pick, Some(Pick::Clip(_))) {
+                        s.pick = None;
+                    }
+                    s.split();
+                }
                 "Copy" => {
                     if let Some(Pick::Clip(id)) = s.pick
                         && let Some(copy) = s.project.duplicate_clip(id)
@@ -2051,16 +2208,18 @@ impl Gallery {
                     }
                 }
                 "Delete" => s.delete(),
-                "Text" => s.add_text(),
+                "Add text" => s.add_text(),
                 "Captions" => s.panel = Panel::Captions,
-                "Overlay" => s.panel = Panel::Photos,
-                "Video" => {
+                "Add photo" => s.panel = Panel::Photos,
+                "Add video" => {
                     s.panel = Panel::Videos;
                     s.append = false;
                 }
                 "Layers" => s.panel = Panel::Layers,
                 "Fade" => s.panel = Panel::Fade,
                 "Audio" => s.panel = Panel::Audio,
+                "Speed" => s.panel = Panel::Speed,
+                "Adjust" => s.panel = Panel::Adjust,
                 "Canvas" => s.panel = Panel::Canvas,
                 "Debug" => s.panel = Panel::Debug,
                 _ => {}
@@ -2083,6 +2242,8 @@ impl Gallery {
             Panel::Photos => "Add overlay",
             Panel::Videos => "Add video",
             Panel::Captions => "Captions",
+            Panel::Speed => "Speed",
+            Panel::Adjust => "Adjust",
             Panel::Debug => "Debug",
             Panel::None => "",
         };
@@ -2158,6 +2319,8 @@ impl Gallery {
                 Panel::Photos => self.studio_photos(s, ui),
                 Panel::Videos => self.studio_videos(s, ui),
                 Panel::Captions => self.studio_captions(s, ui),
+                Panel::Speed => self.studio_speed(s, ui),
+                Panel::Adjust => self.studio_adjust(s, ui),
                 Panel::Debug => self.studio_debug(s, ui, host),
                 Panel::None => {}
             });
@@ -2353,11 +2516,81 @@ impl Gallery {
         });
     }
 
+    fn studio_speed(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        let index = s.segment_index();
+        let count = s.project.segments.len();
+        ui.label(format!("Segment {} of {count}", index + 1));
+        let mut speed = s.project.segments[index].speed() as f32;
+        ui.horizontal_wrapped(|ui| {
+            for preset in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                let chosen = (speed - preset).abs() < 0.005;
+                if ui.add(egui::Button::new(speed_label(preset as f64)).selected(chosen).min_size(vec2(48.0, 36.0))).clicked() {
+                    speed = preset;
+                }
+            }
+        });
+        ui.add(
+            egui::Slider::new(&mut speed, SPEEDS.0..=SPEEDS.1)
+                .logarithmic(true)
+                .text("Speed")
+                .custom_formatter(|v, _| speed_label(v))
+                .custom_parser(|text| text.trim().trim_end_matches(['x', 'X']).trim().parse().ok()),
+        );
+        s.project.set_speed(index, speed);
+        let segment = &s.project.segments[index];
+        ui.small(format!(
+            "{:.1} s of video plays in {:.1} s. Sound keeps its pitch.",
+            segment.source_length() as f32 / 1000.0,
+            segment.length() as f32 / 1000.0
+        ));
+        if count > 1 && ui.button("Use this speed for every segment").clicked() {
+            for i in 0..count {
+                s.project.set_speed(i, speed);
+            }
+        }
+        if s.transcript.as_ref().is_some_and(|t| !t.matches(&s.project)) {
+            ui.small("Transcribe again so captions follow the new timing.");
+        }
+    }
+
+    fn studio_adjust(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        let index = s.segment_index();
+        let count = s.project.segments.len();
+        ui.horizontal(|ui| {
+            ui.label(format!("Segment {} of {count}", index + 1));
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_enabled(!s.project.segments[index].color.is_neutral(), egui::Button::new("Reset")).clicked() {
+                    s.project.segments[index].color = crate::color::Adjust::default();
+                }
+                let compare = ui.add(egui::Button::new("Hold to compare").selected(s.before));
+                s.before = compare.is_pointer_button_down_on();
+            });
+        });
+        let color = &mut s.project.segments[index].color;
+        for (label, field, low, high) in crate::color::CONTROLS {
+            let value = field(color);
+            let exposure = label == "Exposure";
+            ui.add(
+                egui::Slider::new(value, low..=high)
+                    .text(label)
+                    .custom_formatter(move |v, _| if exposure { format!("{v:+.2} EV") } else { format!("{:+.0}", v * 100.0) })
+                    .custom_parser(move |text| {
+                        let number: f64 = text.trim().trim_end_matches("EV").trim().parse().ok()?;
+                        Some(if exposure { number } else { number / 100.0 })
+                    }),
+            );
+        }
+        let color = *color;
+        if count > 1 && ui.button("Use these colors for every segment").clicked() {
+            for segment in &mut s.project.segments {
+                segment.color = color;
+            }
+        }
+        ui.small("Previews on the video and applies to exports.");
+    }
+
     fn studio_fade(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
-        let index = match s.pick {
-            Some(Pick::Segment(i)) if i < s.project.segments.len() => i,
-            _ => s.project.locate(s.playhead).map_or(0, |(i, _)| i),
-        };
+        let index = s.segment_index();
         let count = s.project.segments.len();
         ui.label(format!("Segment {} of {count}", index + 1));
         let segment = &mut s.project.segments[index];
@@ -2474,6 +2707,7 @@ impl Gallery {
                     self.cover(ui, item, rect, 0, Color32::WHITE);
                 }
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &item.name));
+                icons::note(ui, &item.name, rect);
                 if response.clicked() {
                     chosen = Some(item.clone());
                 }
@@ -2537,6 +2771,7 @@ impl Gallery {
                     ui.painter().galley(tag.min + vec2(3.0, 1.0), label, Color32::WHITE);
                 }
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &item.name));
+                icons::note(ui, &item.name, rect);
                 if response.clicked() {
                     chosen = Some(item.clone());
                 }
@@ -2613,7 +2848,7 @@ impl Gallery {
             transcript.words.len(),
             speech::language_name(&transcript.language)
         ));
-        if transcript.ranges != s.project.ranges() {
+        if !transcript.matches(&s.project) {
             ui.colored_label(ACCENT, "The video was edited after transcribing. Transcribe again so the words line up.");
         }
         if transcript.words.is_empty() {
@@ -2636,8 +2871,7 @@ impl Gallery {
             s.caption_mode != CaptionMode::Words,
             egui::Slider::new(&mut s.caption_words, 2..=8).text("Max words"),
         );
-        let layer = s.project.caption_layer();
-        let made = layer.is_some_and(|l| !s.project.layers[l].clips.is_empty());
+        let made = s.project.caption_layer().is_some_and(|l| !s.project.layers[l].clips.is_empty());
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(if made { "Update captions" } else { "Add captions" }).min_size(vec2(150.0, 40.0)))
@@ -2645,16 +2879,12 @@ impl Gallery {
             {
                 s.make_captions();
             }
-            if let Some(l) = layer
-                && ui.button("Remove captions").clicked()
-            {
-                if s.project.layers[l].clips.iter().any(|c| s.pick == Some(Pick::Clip(c.id))) {
-                    s.pick = None;
-                }
-                s.project.layers.remove(l);
+            if s.project.caption_layer().is_some() && ui.button("Remove captions").clicked() {
+                s.remove_captions();
             }
         });
-        if made {
+        let layer = s.project.caption_layer();
+        if made && layer.is_some() {
             let template = s.caption_template();
             let Some(style) = template.text().cloned() else {
                 return;
@@ -2740,7 +2970,7 @@ impl Gallery {
             return;
         };
         let sources: Vec<&str> = s.project.sources.iter().map(|v| v.uri.as_str()).collect();
-        s.heard = Some(s.project.ranges());
+        s.heard = Some((s.project.ranges(), s.project.speeds()));
         s.speech_error.clear();
         bridge::send(json!({
             "op":"transcribe",
@@ -2830,6 +3060,7 @@ impl Gallery {
             max_height: s.height,
             crf: s.crf,
             fps: s.fps.clone(),
+            luts: None,
         };
         let (uri, name) = (s.item.uri.clone(), s.item.name.clone());
         let (sender, receiver) = mpsc::channel();
@@ -2881,7 +3112,7 @@ impl Gallery {
             self.native["speech_model"],
             self.native["speech_busy"],
             self.native["speech_status"].as_str().unwrap_or_default(),
-            s.transcript.as_ref().map_or("none".into(), |t| format!("{} words {} {}", t.words.len(), t.language, if t.ranges == s.project.ranges() { "current" } else { "stale" })),
+            s.transcript.as_ref().map_or("none".into(), |t| format!("{} words {} {}", t.words.len(), t.language, if t.matches(&s.project) { "current" } else { "stale" })),
             s.speech_error
         ));
         ui.horizontal_wrapped(|ui| {
@@ -2896,7 +3127,7 @@ impl Gallery {
                 let job = compose::job(
                     &s.project,
                     &overlays,
-                    &compose::Settings { max_height: s.height, crf: s.crf, fps: s.fps.clone() },
+                    &compose::Settings { max_height: s.height, crf: s.crf, fps: s.fps.clone(), luts: Some("render".into()) },
                 );
                 host.copy_text(job.command());
             }
@@ -2941,6 +3172,14 @@ fn studio_job(
     name: String,
 ) -> Result<Value, String> {
     let size = project.output_size(settings.max_height);
+    for (i, segment) in project.segments.iter().enumerate().filter(|(_, s)| !s.color.is_neutral()) {
+        std::fs::write(render.join(compose::lut_name(i)), segment.color.cube()).map_err(|e| format!("Could not write a color table: {e}"))?;
+    }
+    let settings = &compose::Settings {
+        luts: Some(render.to_string_lossy().into_owned()),
+        fps: settings.fps.clone(),
+        ..*settings
+    };
     let mut overlays = vec![];
     for layer in (0..project.layers.len()).filter(|&l| project.layers[l].visible) {
         if let Some(track) = layer_track(project, layer, pictures, size, rate(&settings.fps), render)? {
@@ -3134,6 +3373,8 @@ mod tests {
         host: Host,
         time: f64,
         gallery: Gallery,
+        /// Labeled widgets of the last frame and their bounds.
+        widgets: Vec<(String, Rect, bool)>,
     }
 
     impl Rig {
@@ -3154,12 +3395,14 @@ mod tests {
             });
             gallery.open_studio();
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
             gallery.theme(&ctx);
             let mut rig = Self {
                 ctx,
                 host: Host::new(),
                 time: 0.0,
                 gallery,
+                widgets: vec![],
             };
             rig.frame(vec![]);
             rig
@@ -3183,6 +3426,25 @@ mod tests {
                 },
             );
             output.textures_delta.clear();
+            if let Some(update) = output.platform_output.accesskit_update {
+                self.widgets = update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, node)| {
+                        let (label, b) = (node.label()?, node.bounds()?);
+                        let rect = Rect::from_min_max(pos2(b.x0 as f32, b.y0 as f32), pos2(b.x1 as f32, b.y1 as f32));
+                        Some((label.to_owned(), rect, node.is_disabled()))
+                    })
+                    .collect();
+            }
+        }
+        /// Bounds of the enabled widget labeled `label`.
+        fn find(&self, label: &str) -> Option<Rect> {
+            self.widgets.iter().find(|(l, _, disabled)| l == label && !disabled).map(|w| w.1)
+        }
+        fn tap_label(&mut self, label: &str) {
+            let rect = self.find(label).unwrap_or_else(|| panic!("No {label:?} in {:?}", self.widgets.iter().map(|w| &w.0).collect::<Vec<_>>()));
+            self.tap(rect.center());
         }
         fn idle(&mut self, seconds: f64) {
             for _ in 0..(seconds * 60.0) as usize {
@@ -3404,6 +3666,93 @@ mod tests {
     }
 
     #[test]
+    fn removing_captions_from_the_captions_panel_keeps_the_editor_open() {
+        let mut rig = Rig::new();
+        rig.caption(0, 3000, 0.5, 0.3);
+        rig.studio().sample_transcript();
+        rig.studio().make_captions();
+        let captions = rig.studio().project.caption_layer();
+        assert_eq!(captions, Some(1), "Captions on top, as when added after a title");
+        rig.studio().panel = Panel::Captions;
+        rig.idle(0.2);
+        rig.tap_label("Remove captions");
+        rig.idle(0.2);
+        let studio = rig.studio();
+        assert_eq!(studio.project.caption_layer(), None);
+        assert_eq!(studio.project.layers.len(), 1, "The title layer stays");
+        assert_eq!(studio.panel, Panel::Captions);
+        assert!(rig.find("Add captions").is_some(), "Panel offers to add them again");
+    }
+
+    #[test]
+    fn playback_sits_below_the_timeline_on_the_chosen_side() {
+        let mut rig = Rig::new();
+        let film = rig.studio().lanes.last().unwrap().1;
+        let play = rig.find("Play").expect("play button");
+        let (start, end) = (rig.find("Go to start").unwrap(), rig.find("Go to end").unwrap());
+        assert!(play.top() > film.bottom(), "Below the timeline: {play:?} vs {film:?}");
+        assert!(SCREEN.x - end.right() < 16.0 && start.left() > 150.0 && play.left() > start.left(), "Right-aligned: {start:?} .. {end:?}");
+        let tools = rig.find("Add video").expect("video tools");
+        assert!(tools.top() > play.bottom(), "Tools under playback");
+        rig.gallery.layout.hand = Hand::Left;
+        rig.idle(0.1);
+        let start = rig.find("Go to start").unwrap();
+        assert!(start.left() < 20.0, "Left-aligned: {start:?}");
+        rig.studio().seek(5000, false);
+        rig.tap_label("Go to start");
+        assert_eq!(rig.studio().playhead, 0);
+        rig.tap_label("Go to end");
+        assert_eq!(rig.studio().playhead, 10_000 - 33);
+    }
+
+    #[test]
+    fn tool_groups_follow_the_selection_without_scrolling() {
+        let mut rig = Rig::new();
+        let id = rig.caption(0, 3000, 0.5, 0.5);
+        rig.studio().pick = Some(Pick::Clip(id));
+        rig.idle(0.1);
+        assert_eq!(rig.studio().group, Group::Text);
+        for label in ["Edit", "Style", "Animate", "Split", "Copy", "Delete"] {
+            let rect = rig.find(label).unwrap_or_else(|| panic!("{label}"));
+            assert!(rect.right() <= SCREEN.x + 0.5, "{label} fits on screen: {rect:?}");
+        }
+        rig.tap_label("Video");
+        assert_eq!(rig.studio().group, Group::Video);
+        rig.studio().seek(5000, false);
+        rig.tap_label("Split");
+        assert_eq!(rig.studio().project.segments.len(), 2, "Video's Split cuts the video even with a caption selected");
+        assert_eq!(rig.studio().pick, Some(Pick::Segment(1)));
+        rig.tap_label("Canvas");
+        rig.tap_label("Debug");
+        assert_eq!(rig.studio().panel, Panel::Debug);
+    }
+
+    #[test]
+    fn speed_and_adjust_panels_change_the_segment() {
+        let mut rig = Rig::new();
+        rig.tap_label("Speed");
+        assert_eq!(rig.studio().panel, Panel::Speed);
+        rig.tap_label("2x");
+        assert_eq!(rig.studio().project.segments[0].speed(), 2.0);
+        assert_eq!(rig.studio().project.length(), 5000);
+        rig.idle(0.1);
+        assert_eq!(rig.studio().sent.as_ref().unwrap()["speeds"], json!([2.0]), "The player follows the speed");
+        rig.tap_label("Done");
+        rig.tap_label("Adjust");
+        assert_eq!(rig.studio().panel, Panel::Adjust);
+        rig.studio().project.segments[0].color.exposure = 1.0;
+        rig.idle(0.1);
+        assert_eq!(rig.gallery.graded.exposure, 1.0, "The stage shows the segment's colors");
+        rig.tap_label("Reset");
+        rig.idle(0.1);
+        assert!(rig.studio().project.segments[0].color.is_neutral());
+        assert!(rig.gallery.graded.is_neutral());
+        rig.gallery.back();
+        rig.gallery.back();
+        assert!(rig.gallery.studio.is_none());
+    }
+
+    #[test]
     fn export_draws_each_layer_as_one_track_with_fades_baked_per_frame() {
         let dir = std::env::temp_dir().join(format!("luma-tracks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3429,7 +3778,7 @@ mod tests {
             enter_ms: 400,
             ..words("Title")
         });
-        let settings = compose::Settings { max_height: 0, crf: 20, fps: "30".into() };
+        let settings = compose::Settings { max_height: 0, crf: 20, fps: "30".into(), luts: None };
         let job = studio_job(&project, &HashMap::new(), &settings, &dir, "u".into(), "n".into()).unwrap();
         let args: Vec<String> = serde_json::from_value(job["args"].clone()).unwrap();
         assert_eq!(args.iter().filter(|a| *a == "concat").count(), 2, "One input per layer");

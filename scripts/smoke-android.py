@@ -28,6 +28,8 @@ class Device:
         self.evidence = Path(evidence)
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.checks = []
+        # Luma started with this set logs its controls' bounds on LumaWidgets lines.
+        self.shell("setprop", "debug.luma.automation", "1")
 
     def adb(self, *args):
         return subprocess.check_output(["adb", "-s", self.serial, *args], timeout=30)
@@ -90,6 +92,42 @@ class Device:
             self.shell("input", "tap", x, y)
         except AssertionError:
             self.tap(*fallback)
+
+    def controls(self):
+        """Labeled controls of the latest frame and their pixel bounds, from Luma's LumaWidgets log lines."""
+        log = self.adb("logcat", "-d", "-v", "raw", "-e", "^LumaWidgets ").decode(errors="replace").splitlines()
+        for line in reversed(log):
+            try:
+                return json.loads(line.removeprefix("LumaWidgets "))
+            except ValueError:
+                continue
+        return []
+
+    def bounds(self, label, fallback):
+        """Pixel bounds of a logged control or lane, else `fallback`."""
+        return next((box for name, box in self.controls() if name == label), fallback)
+
+    def wait_icon(self, label, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for name, (left, top, right, bottom) in self.controls():
+                if name == label:
+                    return (left + right) // 2, (top + bottom) // 2
+            time.sleep(0.25)
+        raise AssertionError(f"No {label!r} control within {timeout}s")
+
+    def tap_icon(self, label, fallback=None, timeout=10):
+        """Taps a control by its label, or at portrait `fallback` coordinates when the log lacks it."""
+        try:
+            x, y = self.wait_icon(label, timeout)
+        except AssertionError:
+            if fallback is None:
+                self.screen("failure")
+                raise
+            print(f"Fallback tap for {label!r}", flush=True)
+            return self.tap(*fallback)
+        self.foreground()
+        self.shell("input", "tap", x, y)
 
     def tap(self, x, y):
         self.foreground()
@@ -167,21 +205,23 @@ class Device:
             time.sleep(2)
             second = self.media("video-4k-moving")
             assert sum(ImageStat.Stat(ImageChops.difference(first, second)).mean) > 2
-            self.tap(435, 2714)  # Pause, verified SVG button.
+            self.tap_icon("Pause", (999, 2868))
             time.sleep(0.4)
+            lane = self.bounds("Video lane", [84, 2093, 1370, 2254])
+            y = (lane[1] + lane[3]) // 2
             try:
-                self.motion("DOWN", 390, 2520)
-                self.motion("MOVE", 830, 2520)
+                self.motion("DOWN", 390, y)
+                self.motion("MOVE", 830, y)
                 self.wait_text("1x")
                 time.sleep(1.5)
                 self.screen("scrub-loupe")
-                self.motion("MOVE", 850, 2080)
+                self.motion("MOVE", 850, y - 440)
                 self.wait_text("20x")
                 self.screen("scrub-loupe-fine")
                 self.checks.append("scrub-loupe-1x-and-20x")
             finally:
-                self.motion("UP", 850, 2080)
-            self.tap(112, 2870)  # Trim mode, verified scissors icon.
+                self.motion("UP", 850, y - 440)
+            self.tap_icon("Trim video", (112, 2714))
             self.wait_text("In")
             self.screen("trim-controls")
             self.checks.append("trim-controls")
