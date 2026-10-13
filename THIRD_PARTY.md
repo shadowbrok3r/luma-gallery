@@ -18,18 +18,20 @@ The launcher and toolbar SVGs are original project assets.
 | Android C++ runtime | NDK distribution | Apache-2.0 with LLVM exception | https://android.googlesource.com/platform/ndk |
 | EguiMobile | 0.1.4, 8098d9d3 | MIT or Apache-2.0 | https://github.com/shadowbrok3r/EguiMobile |
 | egui and egui_extras | 0.36 | MIT or Apache-2.0 | https://github.com/emilk/egui |
+| whisper.cpp and ggml | 1.9.5 | MIT | https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.tar.gz |
+| Whisper base model, ggml q5_1 | Hugging Face ggerganov/whisper.cpp 5359861c, SHA-256 422f1ae4 | MIT (OpenAI Whisper) | Downloaded on first use; not in the APK |
 
 Captions are rasterized with skrifa, harfrust and tiny-skia (MIT or Apache-2.0 / MIT /
 BSD-3-Clause) from the device's system fonts or the fonts egui already bundles (Ubuntu Light
 under the Ubuntu Font Licence 1.0, Hack under MIT/Bitstream Vera, Noto Emoji under OFL-1.1),
 and are burned into exported videos as images.
 `Cargo.lock` records all Rust dependencies. `scripts/prepare-native.sh` records native versions,
-checksums, configuration, and toolchain. FFmpeg, LibRaw, and DNG conversion execute in separate processes;
+checksums, configuration, and toolchain. FFmpeg, LibRaw, DNG conversion and whisper.cpp speech recognition execute in separate processes;
 LibVLC and the shared C++ runtime are dynamically linked and unmodified.
 
 Release APK assets include `source/luma-native-source.tar.xz`, containing the application,
 native bridge, build scripts, and FFmpeg, x264, LibRaw, LibVLC JNI, VLC core, DNG SDK,
-libjxl and libjpeg sources,
+libjxl, libjpeg and whisper.cpp sources,
 including their license texts. The LibVLC build scripts record the core revision, patches,
 and contrib recipes. NDK and toolchain notices are included as well.
 Rust source dependencies are pinned to public Cargo/git sources.

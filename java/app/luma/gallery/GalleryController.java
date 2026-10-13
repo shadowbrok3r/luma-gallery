@@ -7,12 +7,16 @@ import android.media.*;
 import android.net.Uri;
 import android.os.*;
 import android.provider.*;
+import android.system.ErrnoException;
+import android.system.Os;
+import android.system.OsConstants;
 import android.view.*;
 import android.widget.*;
 import org.json.*;
 import org.videolan.libvlc.LibVLC;
 import org.videolan.libvlc.Media;
 import org.videolan.libvlc.MediaPlayer;
+import org.videolan.libvlc.interfaces.IMedia;
 import org.videolan.libvlc.interfaces.IVLCVout;
 import java.io.*;
 import java.lang.Process;
@@ -38,6 +42,7 @@ final class GalleryController {
     private final QwenEdits qwen;
     private final AudioWaveform waveform;
     private final VideoFrames frames;
+    private final Transcriber speech;
     private static final int REQUEST_CONSENT = 702;
     private volatile CompletableFuture<Boolean> consent;
     private volatile boolean managing, manageMedia, rescan;
@@ -77,7 +82,14 @@ final class GalleryController {
     private boolean stageVisible = true, muted, loop;
     private long loopStart, loopEnd;
     private long[] rangeIn = new long[0], rangeOut = new long[0];
-    private long clockTime = -1, clockAt, jumpTarget = -1, jumpAt;
+    private int[] rangeSource = new int[0];
+    private String[] sourceUris = new String[0];
+    /** Edit segment being shown, and the uri of the media in the player. */
+    private int segment;
+    private String loadedUri = "";
+    private long clockTime = -1, clockAt, jumpTarget = -1, jumpAt, hold = -1;
+    private boolean finished;
+    private int pauses;
     private float speed = 1;
     private boolean software;
     private String photoStatus = "", playbackError = "";
@@ -96,6 +108,7 @@ final class GalleryController {
         qwen = new QwenEdits(edits, this::emit);
         waveform = new AudioWaveform(files, this::emit);
         frames = new VideoFrames(activity, files, this::emit, this::scan);
+        speech = new Transcriber(activity, files, this::emit);
         refreshAccess();
         root = activity.findViewById(android.R.id.content);
         audio = (AudioManager) activity.getSystemService(Context.AUDIO_SERVICE);
@@ -114,10 +127,10 @@ final class GalleryController {
             if (closed) return;
             JSONObject state = new JSONObject();
             try {
-                boolean playing = player != null && player.isPlaying();
+                boolean playing = player != null && player.isPlaying() && hold < 0;
                 long position = player == null ? 0 : Math.max(0, player.getTime());
                 long duration = player == null ? 0 : Math.max(0, player.getLength());
-                if (playing && loop && loopEnd > loopStart && position >= loopEnd - 15) player.setTime(loopStart, false);
+                if (finished && !playing) position = Math.max(position, span(false) - 40);
                 if (playing) activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 else activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 state.put("playing", playing).put("position", position).put("duration", duration)
@@ -125,36 +138,72 @@ final class GalleryController {
                     .put("rate", speed).put("error", playbackError).put("photo_status", photoStatus)
                     .put("zoom", photo == null ? 1 : photo.zoomValue());
                 if (selected != null) state.put("uri", selected.optString("uri"));
+                if (rangeIn.length > 0) state.put("segment", segment);
             } catch (Exception ignored) { }
             playback = state;
             main.postDelayed(this, player != null && player.isPlaying() ? 33 : 100);
         }
     };
 
-    /** Plays only the edit's source ranges, extrapolating LibVLC's coarse clock between updates. */
+    /** Keeps playback inside the edit's ranges, the loop or the file, extrapolating LibVLC's coarse clock between updates. */
     private final Runnable rangeWatch = new Runnable() {
         @Override public void run() {
-            if (closed || rangeIn.length == 0) return;
-            if (player != null && player.isPlaying()) {
+            if (closed || player == null) return;
+            boolean playing = player.isPlaying() && hold < 0;
+            if (playing) {
                 long time = player.getTime(), now = SystemClock.uptimeMillis();
-                boolean settling = now - jumpAt < 600 && time < jumpTarget - 100;
+                boolean settling = now - jumpAt < 600
+                    && (time < jumpTarget - 100 || time > jumpTarget + 100 + (long)((now - jumpAt) * speed));
                 if (time != clockTime) { clockTime = time; clockAt = now; }
                 long at = clockTime + (long)(Math.min(400, now - clockAt) * speed);
-                int i = 0;
-                while (i < rangeIn.length && at >= rangeOut[i] - 25) i++;
+                long start = span(true), end = span(false);
                 if (settling) { }
-                else if (i >= rangeIn.length) {
-                    player.pause();
-                    player.setTime(Math.max(rangeIn[rangeIn.length - 1], rangeOut[rangeOut.length - 1] - 40), false);
-                    clockTime = -1;
-                } else if (at < rangeIn[i] - 60) {
-                    player.setTime(rangeIn[i], false);
-                    jumpTarget = rangeIn[i]; jumpAt = now; clockTime = rangeIn[i]; clockAt = now;
-                }
+                else if (rangeIn.length > 0) follow(at, now);
+                else if (end <= 0) { }
+                else if (at >= end - 25 && loop && loopEnd > loopStart) jump(start, now);
+                else if (at >= end - 25) park(end - 40);
+                else if (at < start - 60) jump(start, now);
             } else clockTime = -1;
-            main.postDelayed(this, 15);
+            main.postDelayed(this, playing ? 15 : 60);
         }
     };
+
+    /** Moves to the next edit segment as playback crosses the current one's end. */
+    private void follow(long at, long now) {
+        int i = Math.min(segment, rangeIn.length - 1);
+        if (at < rangeIn[i] - 60) { jump(rangeIn[i], now); return; }
+        if (at < rangeOut[i] - 25) return;
+        int next = i + 1;
+        if (next >= rangeIn.length) { park(Math.max(rangeIn[i], rangeOut[i] - 40)); return; }
+        segment = next;
+        if (!uriOf(next).equals(loadedUri)) load(uriOf(next), rangeIn[next], true);
+        else if (Math.abs(rangeIn[next] - rangeOut[i]) > 40) jump(rangeIn[next], now);
+    }
+
+    private void park(long time) {
+        pausePlayer();
+        player.setTime(time, false);
+        clockTime = -1; finished = true;
+    }
+
+    private String uriOf(int index) {
+        int source = index < rangeSource.length ? rangeSource[index] : 0;
+        if (source < sourceUris.length) return sourceUris[source];
+        return selected == null ? "" : selected.optString("uri");
+    }
+
+    private void jump(long target, long now) {
+        player.setTime(target, false);
+        jumpTarget = target; jumpAt = now; clockTime = target; clockAt = now; finished = false;
+    }
+
+    /** Start or end of what plays: the edit's ranges, the loop selection or the whole file. */
+    private long span(boolean start) {
+        if (rangeIn.length > 0) return start ? rangeIn[0] : rangeOut[rangeOut.length - 1];
+        long length = player == null ? 0 : player.getLength();
+        if (!loop || loopEnd <= loopStart) return start ? 0 : length;
+        return start ? loopStart : length > 0 ? Math.min(loopEnd, length) : loopEnd;
+    }
 
     void emit(JSONObject event) { if (!closed) events.add(event); }
     void attachVideoSurface(Surface surface,int width,int height) { main.post(() -> { gpuSurface=surface; bufferWidth=width; bufferHeight=height; layoutStage(); }); }
@@ -171,7 +220,9 @@ final class GalleryController {
                 .put("manage_media", manageMedia).put("managing", managing).put("manage_status", manageStatus)
                 .put("manage_progress", manageProgress).put("photo_saving", edits.busy).put("photo_edit_status", edits.status)
                 .put("qwen_busy", qwen.busy).put("qwen_status", qwen.status)
-                .put("frame_saving", frames.busy).toString();
+                .put("frame_saving", frames.busy).put("speech_busy", speech.busy).put("speech_status", speech.status)
+                .put("speech_progress", speech.progress).put("speech_model", speech.modelReady)
+                .put("locale", Locale.getDefault().getLanguage()).toString();
         } catch (Exception e) { return "{}"; }
     }
 
@@ -197,10 +248,14 @@ final class GalleryController {
                             stageX = data.getInt("x"); stageY = data.getInt("y"); stageWidth = data.getInt("w"); stageHeight = data.getInt("h");
                             stageVisible = data.optBoolean("visible", true); layoutStage(); break;
                         case "play": togglePlay(data.optBoolean("playing", true)); break;
-                        case "seek": if (player != null) player.setTime(Math.max(0, data.getLong("time")), data.optBoolean("fast", false)); break;
-                        case "segments": ranges(data.optJSONArray("ranges")); break;
+                        case "seek": seek(Math.max(0, data.getLong("time")), data.optBoolean("fast", false), data.optInt("segment", -1)); break;
+                        case "segments": ranges(data.optJSONArray("ranges"), data.optJSONArray("sources")); break;
+                        case "probe": probe(data.getJSONObject("item")); break;
                         case "studio_export": studioExport(data); break;
-                        case "mute": muted = data.getBoolean("muted"); if (player != null) player.setVolume(muted ? 0 : 100); break;
+                        case "transcribe": speech.run(data); break;
+                        case "cancel_transcribe": speech.cancel(); break;
+                        case "speech_model_delete": speech.deleteModel(); break;
+                        case "mute": muted = data.getBoolean("muted"); if (player != null && hold < 0) player.setVolume(muted ? 0 : 100); break;
                         case "rate": speed = (float)data.getDouble("rate"); if (player != null) player.setRate(speed); break;
                         case "loop": loop = data.getBoolean("enabled"); loopStart = data.optLong("start"); loopEnd = data.optLong("end"); break;
                         case "preview": showPreview(data); break;
@@ -214,7 +269,7 @@ final class GalleryController {
                                 // While playing, sample the clock on the player thread at the tap.
                                 // A paused/pending seek uses the exact position chosen in the UI.
                                 long at = player != null && player.isPlaying() ? player.getTime() : data.optLong("time");
-                                if (player != null) player.pause();
+                                togglePlay(false);
                                 frames.save(new JSONObject(selected.toString()), Math.max(0, at));
                             }
                             break;
@@ -415,20 +470,32 @@ final class GalleryController {
                 if(event.type==MediaPlayer.Event.Playing || event.type==MediaPlayer.Event.Vout) {
                     videoTrackSize(); layoutStage();
                 }
+                if (event.type == MediaPlayer.Event.Playing) {
+                    playbackError = ""; pauses = 0;
+                    if (hold >= 0) { pausePlayer(); player.setTime(hold, false); player.setVolume(muted ? 0 : 100); hold = -1; }
+                }
+                // Unrequested pauses come from play-and-pause at the end of the input.
+                if (event.type == MediaPlayer.Event.Paused) {
+                    if (pauses > 0) pauses--;
+                    else if (segment + 1 < rangeIn.length) {
+                        segment++;
+                        if (!uriOf(segment).equals(loadedUri)) load(uriOf(segment), rangeIn[segment], true);
+                        else { jump(rangeIn[segment], SystemClock.uptimeMillis()); player.play(); }
+                    }
+                    else if (rangeIn.length == 0 && loop && loopEnd > loopStart) { jump(loopStart, SystemClock.uptimeMillis()); player.play(); }
+                    else finished = true;
+                }
                 if (event.type == MediaPlayer.Event.EncounteredError) {
+                    if (hold >= 0) { player.setVolume(muted ? 0 : 100); hold = -1; }
                     playbackError = "This recording could not play. Try a playback proxy.";
                     error(playbackError);
                 }
-                if (event.type == MediaPlayer.Event.EndReached && loop && player != null) {
-                    player.stop(); player.play(); player.setTime(loopStart, false);
-                }
+                if (event.type == MediaPlayer.Event.EndReached && rangeIn.length == 0 && loop && loopEnd > loopStart) reopen(loopStart, true);
             });
-            Media media = new Media(vlc, source.fd.getFileDescriptor());
-            media.setHWDecoderEnabled(!software, false);
-            media.addOption(":file-caching=250");
-            player.setMedia(media); media.release();
+            attach(source); loadedUri = item.getString("uri");
             player.setVolume(muted ? 0 : 100); player.setRate(speed);
             layoutStage(); togglePlay(true);
+            main.removeCallbacks(rangeWatch); main.post(rangeWatch);
             io.execute(() -> {
                 try {
                     JSONObject metadata = files.probe(item);
@@ -465,6 +532,15 @@ final class GalleryController {
                 photo.load(source.fd.getFileDescriptor(),Uri.parse(item.getString("uri")));
             }
         }
+    }
+
+    /** Gives the player `src` as its media. */
+    private void attach(MediaFiles.Source src) {
+        Media media = new Media(vlc, src.fd.getFileDescriptor());
+        media.setHWDecoderEnabled(!software, false);
+        media.addOption(":file-caching=250");
+        media.addOption(":play-and-pause");
+        player.setMedia(media); media.release();
     }
 
     private void layoutStage() {
@@ -507,11 +583,94 @@ final class GalleryController {
 
     private void togglePlay(boolean play) {
         if (player == null) return;
-        if (play) { if (audio.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) player.play(); }
-        else player.pause();
+        if (!play) {
+            // An opening input is paused from its Playing event.
+            if (hold >= 0) return;
+            if (player.getPlayerState() == IMedia.State.Opening) { hold = Math.max(0, position()); player.setVolume(0); }
+            else pausePlayer();
+            return;
+        }
+        if (audio.requestAudioFocus(focus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return;
+        boolean edit = rangeIn.length > 0;
+        if (edit && finished) seek(rangeIn[0], false, 0);
+        long start = span(true), end = span(false), at = position();
+        if (ended()) { reopen(edit ? Math.max(0, at) : at >= 0 && at < end - 400 ? at : start, true); return; }
+        if (hold >= 0) { hold = -1; player.setVolume(muted ? 0 : 100); }
+        if (!edit && (finished || (end > 0 && at < start - 60))) jump(start, SystemClock.uptimeMillis());
+        player.play();
     }
 
-    void pause() { main.post(() -> { if (player != null) player.pause(); endPreview(); }); }
+    /** Seeks the media in the player, or edit segment `index` of the edit, loading its video when needed. */
+    private void seek(long time, boolean fast, int index) {
+        if (player == null) return;
+        if (index >= 0 && index < rangeIn.length) {
+            segment = index;
+            if (!uriOf(index).equals(loadedUri)) { load(uriOf(index), time, player.isPlaying() && hold < 0); return; }
+        }
+        long length = player.getLength();
+        if (length > 0) time = Math.min(time, Math.max(0, length - 40));
+        if (ended()) { reopen(time, false); return; }
+        if (hold >= 0) hold = time;
+        player.setTime(time, fast);
+        jumpTarget = time; jumpAt = SystemClock.uptimeMillis(); clockTime = -1; finished = false;
+    }
+
+    private void pausePlayer() {
+        if (player.isPlaying()) pauses++;
+        player.pause();
+    }
+
+    /** The latest seek target while LibVLC's coarse clock catches up, else the player's time. */
+    private long position() {
+        return SystemClock.uptimeMillis() - jumpAt < 600 ? jumpTarget : player.getTime();
+    }
+
+    /** Input states in which LibVLC ignores play() and seeks. */
+    private boolean ended() {
+        int state = player.getPlayerState();
+        return state == IMedia.State.Ended || state == IMedia.State.Stopped || state == IMedia.State.Error;
+    }
+
+    /** Restarts the input at `time` from a rewound descriptor. */
+    private void reopen(long time, boolean play) {
+        player.stop();
+        if (source != null) try { Os.lseek(source.fd.getFileDescriptor(), 0, OsConstants.SEEK_SET); }
+        catch (ErrnoException e) { android.util.Log.w("Luma", "Rewind: " + e.getMessage()); }
+        start(time, play);
+    }
+
+    /** Puts another video of the edit in the player at `time`. */
+    private void load(String uri, long time, boolean play) {
+        MediaFiles.Source next;
+        try { next = files.source(uri); }
+        catch (Exception e) { error("Could not open a video in the edit: " + e.getMessage()); return; }
+        MediaFiles.Source previous = source;
+        attach(next);
+        source = next; loadedUri = uri;
+        if (previous != null) try { previous.close(); } catch (Exception ignored) { }
+        start(time, play);
+    }
+
+    /** Starts the player's input at `time`, held paused until its Playing event unless `play`. */
+    private void start(long time, boolean play) {
+        hold = play ? -1 : time; pauses = 0;
+        player.setVolume(play && !muted ? 100 : 0);
+        player.play();
+        player.setTime(time, false);
+        jumpTarget = time; jumpAt = SystemClock.uptimeMillis(); clockTime = -1; finished = false;
+    }
+
+    private void probe(JSONObject item) {
+        io.execute(() -> {
+            JSONObject details;
+            try { details = files.probe(item); }
+            catch (Exception e) { android.util.Log.w("Luma", "Probe: " + e.getMessage()); details = new JSONObject(); }
+            try { emit(new JSONObject().put("type", "probe").put("uri", item.optString("uri")).put("probe", details)); }
+            catch (JSONException ignored) { }
+        });
+    }
+
+    void pause() { main.post(() -> { togglePlay(false); endPreview(); }); }
 
     void photoReady(PhotoView origin,int width,int height) {
         if (photo != origin || selected == null) return;
@@ -541,7 +700,8 @@ final class GalleryController {
         if (photo != null) { photo.close(); photo = null; }
         if (source != null) try { source.close(); } catch (Exception ignored) { }
         source = null; selected = null; loop = false; playbackError = ""; photoStatus = "";
-        rangeIn = new long[0]; rangeOut = new long[0]; main.removeCallbacks(rangeWatch);
+        rangeIn = new long[0]; rangeOut = new long[0]; rangeSource = new int[0]; sourceUris = new String[0];
+        segment = 0; loadedUri = ""; hold = -1; main.removeCallbacks(rangeWatch);
         audio.abandonAudioFocusRequest(focus);
         activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
@@ -623,13 +783,20 @@ final class GalleryController {
         });
     }
 
-    private void ranges(JSONArray ranges) throws JSONException {
+    private void ranges(JSONArray ranges, JSONArray sources) throws JSONException {
         int count = ranges == null ? 0 : ranges.length();
         long[] in = new long[count], out = new long[count];
-        for (int i = 0; i < count; i++) { in[i] = ranges.getJSONArray(i).getLong(0); out[i] = ranges.getJSONArray(i).getLong(1); }
-        rangeIn = in; rangeOut = out; clockTime = -1;
-        main.removeCallbacks(rangeWatch);
-        if (count > 0) main.post(rangeWatch);
+        int[] from = new int[count];
+        for (int i = 0; i < count; i++) {
+            JSONArray range = ranges.getJSONArray(i);
+            in[i] = range.getLong(0); out[i] = range.getLong(1); from[i] = range.optInt(2, 0);
+        }
+        String[] uris = new String[sources == null ? 0 : sources.length()];
+        for (int i = 0; i < uris.length; i++) uris[i] = sources.getString(i);
+        rangeIn = in; rangeOut = out; rangeSource = from; sourceUris = uris; clockTime = -1;
+        segment = Math.min(segment, Math.max(0, count - 1));
+        String primary = selected == null ? "" : selected.optString("uri");
+        if (count == 0 && player != null && !primary.isEmpty() && !loadedUri.equals(primary)) load(primary, 0, false);
     }
 
     private void locateKeyframe(JSONObject request) {
@@ -747,25 +914,23 @@ final class GalleryController {
         }
     }
 
-    /** Runs the editor's FFmpeg arguments against the open video and publishes the result. */
+    /** Runs the editor's FFmpeg arguments against the edit's videos and publishes the result. */
     private void studioExport(JSONObject request) throws Exception {
         if (exporting) { error("Wait for the current export to finish"); return; }
         final JSONObject item = selected;
         if (item == null || !item.optString("uri").equals(request.optString("uri"))) { error("Open the video before exporting"); return; }
         final JSONArray args = request.getJSONArray("args");
+        final JSONArray uris = request.optJSONArray("sources");
         final long lengthUs = Math.max(1, request.optLong("duration")) * 1000;
         exporting = true; exportProgress = 0; exportStatus = "Rendering video"; exportUri = "";
         exportCancelled.set(false);
         pause();
         exports.execute(() -> {
             File output = null;
-            try (MediaFiles.Source src = files.source(item.getString("uri"))) {
+            Map<Integer, MediaFiles.Source> opened = new HashMap<>();
+            try {
                 output = new File(activity.getCacheDir(), "studio-" + System.currentTimeMillis() + ".mp4");
-                List<String> command = new ArrayList<>();
-                for (int i = 0; i < args.length(); i++) {
-                    String arg = args.getString(i);
-                    command.add("{source}".equals(arg) ? src.path : "{output}".equals(arg) ? output.getAbsolutePath() : arg);
-                }
+                List<String> command = files.command(args, uris, item.getString("uri"), opened, output.getAbsolutePath());
                 files.run("ffmpeg", command, 7200, exportProcess, line -> {
                     if (exportCancelled.get()) { Process process=exportProcess.get(); if (process!=null) process.destroyForcibly(); }
                     if (line.startsWith("out_time_us=")) try { exportProgress=Math.min(0.99,Long.parseLong(line.substring(12))/(double)lengthUs); } catch (Exception ignored) { }
@@ -782,6 +947,7 @@ final class GalleryController {
                 exportStatus = exportCancelled.get() ? "Export cancelled" : "Export failed";
                 if (!exportCancelled.get()) error("Export: " + e.getMessage());
             } finally {
+                for (MediaFiles.Source src : opened.values()) try { src.close(); } catch (Exception ignored) { }
                 if (output != null) output.delete();
                 exporting = false;
                 files.pruneCache(Collections.emptySet());
@@ -833,7 +999,7 @@ final class GalleryController {
     }
 
     void close() {
-        edits.close(); qwen.close(); waveform.close(); frames.close();
+        edits.close(); qwen.close(); waveform.close(); frames.close(); speech.close();
         closed=true; main.removeCallbacks(tick); main.removeCallbacks(rangeWatch); closeMedia();
         Process process=exportProcess.get(); if(process!=null) process.destroyForcibly();
         CompletableFuture<Boolean> answer=consent; if(answer!=null) answer.complete(false);

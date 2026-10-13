@@ -6,6 +6,7 @@ mod edit;
 mod icons;
 mod mask;
 mod model;
+mod speech;
 mod studio;
 
 use egui::Color32;

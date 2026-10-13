@@ -4,17 +4,18 @@ import android.os.ParcelFileDescriptor;
 import java.io.*;
 import java.util.List;
 
-/** Passes an already-authorized media descriptor without reopening its protected backing path. */
+/** Passes already-authorized media descriptors without reopening their protected backing paths. */
 final class MediaProcess extends Process {
     static { System.loadLibrary("luma_process"); }
-    private static native int[] spawn(String[] args, int input) throws IOException;
+    private static native int[] spawn(String[] args, int[] inputs, int[] targets) throws IOException;
     private static native int waitChild(int pid, boolean block);
     private final int pid;
     private final InputStream output;
     private Integer result;
 
-    MediaProcess(List<String> args, int input) throws IOException {
-        int[] child = spawn(args.toArray(new String[0]), input);
+    /** Each `inputs` descriptor becomes descriptor `targets` of the same index in the child. */
+    MediaProcess(List<String> args, int[] inputs, int[] targets) throws IOException {
+        int[] child = spawn(args.toArray(new String[0]), inputs, targets);
         pid = child[0];
         output = new ParcelFileDescriptor.AutoCloseInputStream(ParcelFileDescriptor.adoptFd(child[1]));
     }

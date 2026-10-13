@@ -18,6 +18,8 @@ fetch https://download.adobe.com/pub/adobe/dng/dng_sdk_1_7_1_2724_20260908.zip .
 fetch https://repo.maven.apache.org/maven2/org/videolan/android/libvlc-all/3.7.7/libvlc-all-3.7.7.aar .build/downloads/libvlc.aar b48dab96e0e90e34cce3861963500c144a5aadb1b249d501d6a4b104d849e61b
 fetch https://code.videolan.org/videolan/libvlcjni/-/archive/0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6/libvlcjni-0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6.tar.gz .build/downloads/libvlcjni-source.tar.gz bafba3f63830d7a049d753f8ffe6fecdcf0abcfed8e449355e87205da18854ec
 fetch https://code.videolan.org/videolan/vlc/-/archive/84177b2273abc5c4300234e6e18b55a4d2dd5a03/vlc-84177b2273abc5c4300234e6e18b55a4d2dd5a03.tar.gz .build/downloads/vlc-source.tar.gz aeb337f3487011d5f826b360b47c32c28fa3dbca737ac638b91f8ce31147ad20
+fetch https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.tar.gz .build/downloads/whisper.cpp-1.9.5.tar.gz ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720
+if [ ! -d native/vendor/whisper.cpp-1.9.5 ]; then tar -xf .build/downloads/whisper.cpp-1.9.5.tar.gz -C native/vendor; fi
 if [ ! -d native/vendor/libvlcjni-0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6 ]; then tar -xf .build/downloads/libvlcjni-source.tar.gz -C native/vendor; fi
 if [ ! -d native/vendor/vlc-84177b2273abc5c4300234e6e18b55a4d2dd5a03 ]; then tar -xf .build/downloads/vlc-source.tar.gz -C native/vendor; fi
 cp "$ndk/NOTICE" native/vendor/ANDROID-NDK-NOTICE
@@ -67,7 +69,7 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                 make install-lib-static
             )
         fi
-        if [ ! -f ".build/$archabi/ffmpeg-studio-v1-ready" ]; then
+        if [ ! -f ".build/$archabi/ffmpeg-studio-v2-ready" ]; then
             (
                 cd ".build/$archabi/ffmpeg"
                 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
@@ -78,8 +80,8 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                     --disable-shared --enable-static --disable-debug --disable-doc --disable-network \
                     --disable-autodetect --disable-everything --enable-ffmpeg --enable-ffprobe \
                     --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale --enable-swresample \
-                    --enable-protocol=file,pipe,fd --enable-demuxer=mov,matroska,avi,image2,image_jpeg_pipe,image_png_pipe,image_ppm_pipe,wav \
-                    --enable-muxer=mp4,mov,image2,null \
+                    --enable-protocol=file,pipe,fd --enable-demuxer=mov,matroska,avi,image2,image_jpeg_pipe,image_png_pipe,image_ppm_pipe,wav,concat \
+                    --enable-muxer=mp4,mov,image2,null,wav \
                     --enable-decoder=h264,hevc,aac,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32le,mjpeg,png,ppm,rawvideo,flac,mp3,opus,vorbis,vp8,vp9,av1 \
                     --enable-encoder=libx264,aac,mjpeg,png,pcm_s16le --enable-parser=h264,hevc,aac,mjpeg,vp8,vp9,av1 \
                     --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
@@ -89,8 +91,23 @@ for abi in "${@:-arm64-v8a x86_64}"; do
                 make -j"$jobs"
                 cp ffmpeg "$root/native/libs/$archabi/libffmpeg_exec.so"
                 cp ffprobe "$root/native/libs/$archabi/libffprobe_exec.so"
-                touch "$root/.build/$archabi/ffmpeg-studio-v1-ready"
+                touch "$root/.build/$archabi/ffmpeg-studio-v2-ready"
             )
+        fi
+        if [ ! -f ".build/$archabi/whisper-1.9.5-ready" ]; then
+            case "$archabi" in
+                arm64-v8a) cpu=(-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16) ;;
+                x86_64) cpu=(-DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_F16C=ON) ;;
+            esac
+            cmake -S native/vendor/whisper.cpp-1.9.5 -B ".build/$archabi/whisper" -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+                -DANDROID_ABI="$archabi" -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
+                -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+                -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-z,max-page-size=16384' "${cpu[@]}"
+            cmake --build ".build/$archabi/whisper" --target whisper-cli -j "$jobs"
+            cp ".build/$archabi/whisper/bin/whisper-cli" "native/libs/$archabi/libwhisper_exec.so"
+            touch ".build/$archabi/whisper-1.9.5-ready"
         fi
         if [ ! -f "$prefix/lib/libraw.a" ]; then
             (

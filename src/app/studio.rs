@@ -3,6 +3,7 @@ use crate::caption;
 use crate::studio::Align as TextAlign;
 use egui::Align;
 use crate::compose;
+use crate::speech::{self, CaptionMode, Transcript};
 use crate::studio::*;
 use image::RgbaImage;
 use std::hash::{Hash, Hasher};
@@ -40,6 +41,8 @@ pub(super) enum Panel {
     Layers,
     Export,
     Photos,
+    Videos,
+    Captions,
     Debug,
 }
 
@@ -128,6 +131,10 @@ pub(super) struct Studio {
     hits: Vec<Hit>,
     frame: Rect,
     track: Rect,
+    /// The add-video tile after the last segment.
+    plus: Rect,
+    /// Added videos go to the end instead of the cut nearest the playhead.
+    append: bool,
     lanes: Vec<(Lane, Rect)>,
     previews: HashMap<u64, Preview>,
     tiles: HashMap<String, egui::TextureHandle>,
@@ -138,7 +145,10 @@ pub(super) struct Studio {
     pub crf: u8,
     fps: String,
     dir: Option<PathBuf>,
-    sent: Option<Vec<[i64; 2]>>,
+    sent: Option<Value>,
+    /// Waveforms of added videos by uri, and the one being read.
+    waves: HashMap<String, crate::edit::Waveform>,
+    wave_pending: Option<(String, Instant)>,
     reported: Option<(i64, Instant)>,
     seeking: Option<(i64, Instant)>,
     last_seek: Instant,
@@ -147,31 +157,50 @@ pub(super) struct Studio {
     hit_boxes: bool,
     render_ms: f32,
     renders: u32,
+    /// Words recognized from the timeline's audio, saved beside the project and outside undo.
+    transcript: Option<Transcript>,
+    /// Timeline ranges of the transcription in progress.
+    heard: Option<Vec<[i64; 3]>>,
+    speech_error: String,
+    language: String,
+    caption_mode: CaptionMode,
+    caption_words: usize,
+    /// The selected clip as of the last frame, for spreading edits through linked layers.
+    follow: Option<Clip>,
 }
 
 impl Studio {
     pub fn new(item: MediaItem, fps: f64, fps_text: String, has_audio: bool, dir: Option<PathBuf>) -> Self {
         let mut project = Project::new(&item.uri, &item.name, item.duration, item.width, item.height);
+        let primary = Source {
+            has_audio,
+            size: item.size,
+            modified: item.modified,
+            ..project.sources[0].clone()
+        };
         if let Some(saved) = dir
             .as_ref()
             .and_then(|d| std::fs::read(d.join(project_file(&item.uri, 0, item.size))).ok())
             .and_then(|bytes| serde_json::from_slice::<Project>(&bytes).ok())
             .filter(|p| {
                 p.source == item.uri
-                    && (p.duration - project.duration).abs() < 250
+                    && p.sources.first().is_none_or(|s| (s.duration - primary.duration).abs() < 250)
                     && !p.segments.is_empty()
             })
         {
             project = Project {
                 width: project.width,
                 height: project.height,
-                duration: project.duration,
                 ..saved
             };
         }
+        project.set_primary(primary);
+        if project.segments.is_empty() {
+            project = Project::new(&item.uri, &item.name, item.duration, item.width, item.height);
+            project.sources[0].has_audio = has_audio;
+        }
         project.fps = fps;
-        project.has_audio = has_audio;
-        if !has_audio {
+        if !project.has_audio() {
             project.audio.keep = false;
         }
         Self {
@@ -194,6 +223,8 @@ impl Studio {
             hits: vec![],
             frame: Rect::NOTHING,
             track: Rect::NOTHING,
+            plus: Rect::NOTHING,
+            append: false,
             lanes: vec![],
             previews: HashMap::new(),
             tiles: HashMap::new(),
@@ -205,6 +236,8 @@ impl Studio {
             fps: fps_text,
             dir,
             sent: None,
+            waves: HashMap::new(),
+            wave_pending: None,
             reported: None,
             seeking: None,
             last_seek: Instant::now(),
@@ -213,6 +246,35 @@ impl Studio {
             hit_boxes: false,
             render_ms: 0.0,
             renders: 0,
+            transcript: None,
+            heard: None,
+            speech_error: String::new(),
+            language: String::new(),
+            caption_mode: CaptionMode::Phrases,
+            caption_words: 4,
+            follow: None,
+        }
+        .with_transcript()
+    }
+
+    fn words_file(&self) -> Option<PathBuf> {
+        self.file().map(|f| f.with_extension("words.json"))
+    }
+
+    fn with_transcript(mut self) -> Self {
+        self.transcript = self
+            .words_file()
+            .and_then(|f| std::fs::read(f).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        self
+    }
+
+    fn save_transcript(&self) {
+        if let (Some(dir), Some(file), Some(transcript)) = (&self.dir, self.words_file(), &self.transcript)
+            && std::fs::create_dir_all(dir).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(transcript)
+        {
+            let _ = std::fs::write(file, bytes);
         }
     }
 
@@ -247,6 +309,48 @@ impl Studio {
     }
 
     pub fn event(&mut self, e: &Value) {
+        let uri = e["uri"].as_str().unwrap_or_default();
+        match e["type"].as_str() {
+            Some("probe") => return self.probed(uri, &e["probe"]),
+            Some("transcript") => {
+                let path = e["path"].as_str().unwrap_or_default();
+                match std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| speech::parse(&bytes)) {
+                    Ok(transcript) => {
+                        self.transcript = Some(Transcript {
+                            ranges: self.heard.take().unwrap_or_else(|| self.project.ranges()),
+                            ..transcript
+                        });
+                        self.speech_error.clear();
+                        self.save_transcript();
+                    }
+                    Err(message) => self.speech_error = message,
+                }
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            Some("transcript_error") => {
+                self.heard = None;
+                self.speech_error = e["message"].as_str().unwrap_or("Transcription failed").into();
+                return;
+            }
+            Some("waveform") if uri != self.item.uri => {
+                if self.wave_pending.as_ref().is_some_and(|(pending, _)| pending == uri) {
+                    self.wave_pending = None;
+                }
+                if self.project.sources.iter().any(|v| v.uri == uri) {
+                    self.waves.insert(
+                        uri.to_owned(),
+                        crate::edit::Waveform {
+                            peaks: serde_json::from_value(e["peaks"].clone()).unwrap_or_default(),
+                            step_ms: e["step_ms"].as_f64().unwrap_or(0.0),
+                            status: e["status"].as_str().unwrap_or_default().into(),
+                        },
+                    );
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some(session) = e["session"].as_str() else {
             return;
         };
@@ -277,6 +381,78 @@ impl Studio {
         if let Some(Body::Picture(picture)) = self.project.clip_mut(id).map(|c| &mut c.body) {
             picture.path = path;
             picture.aspect = (h / w.max(1.0)) as f32;
+        }
+    }
+
+    /// Library item for source `n`, for thumbnails and waveforms.
+    fn media(&self, n: usize) -> MediaItem {
+        if n == 0 {
+            return self.item.clone();
+        }
+        let video = self.project.sources.get(n).cloned().unwrap_or_default();
+        MediaItem {
+            uri: video.uri,
+            name: video.name,
+            kind: "video".into(),
+            width: video.width,
+            height: video.height,
+            duration: video.duration,
+            size: video.size,
+            modified: video.modified,
+            ..MediaItem::default()
+        }
+    }
+
+    /// Inserts a library video at the cut nearest the playhead and selects it.
+    fn add_video(&mut self, item: &MediaItem) -> bool {
+        if !item.is_video() || item.duration < MIN_CLIP {
+            return false;
+        }
+        let index = self.project.insert_video(
+            Source {
+                uri: item.uri.clone(),
+                name: item.name.clone(),
+                duration: item.duration,
+                width: item.width.max(2),
+                height: item.height.max(2),
+                has_audio: true,
+                size: item.size,
+                modified: item.modified,
+                ..Source::default()
+            },
+            if self.append { self.project.length() } else { self.playhead },
+        );
+        if !self.project.sources[self.project.segments[index].source].probed {
+            bridge::send(json!({"op":"probe","item":item}));
+        }
+        self.pick = Some(Pick::Segment(index));
+        self.panel = Panel::None;
+        self.playhead = self.project.starts()[index];
+        true
+    }
+
+    /// Applies an added video's ffprobe streams: displayed size and audio.
+    fn probed(&mut self, uri: &str, probe: &Value) {
+        let had_audio = self.project.has_audio();
+        for video in self.project.sources.iter_mut().skip(1).filter(|v| v.uri == uri) {
+            if let Some(streams) = probe["streams"].as_array() {
+                if let Some(stream) = streams.iter().find(|s| s["codec_type"] == "video") {
+                    let (w, h) = (stream["width"].as_u64().unwrap_or(0) as u32, stream["height"].as_u64().unwrap_or(0) as u32);
+                    let rotation = stream["side_data_list"]
+                        .as_array()
+                        .and_then(|list| list.iter().find_map(|d| d["rotation"].as_f64()))
+                        .or_else(|| stream["tags"]["rotate"].as_str().and_then(|r| r.parse().ok()))
+                        .unwrap_or(0.0);
+                    if w > 0 && h > 0 {
+                        (video.width, video.height) = if (rotation.abs().round() as i64) % 180 == 90 { (h, w) } else { (w, h) };
+                    }
+                }
+                video.has_audio = streams.iter().any(|s| s["codec_type"] == "audio");
+            }
+            video.probed = true;
+        }
+        if !had_audio && self.project.has_audio() {
+            self.project.audio.keep = true;
         }
     }
 
@@ -391,6 +567,7 @@ impl Studio {
     }
 
     fn undo(&mut self) {
+        self.follow = None;
         if self.history.undo(&mut self.project) {
             self.shadow = self.project.clone();
             self.pick = self.pick.filter(|p| match p {
@@ -402,6 +579,7 @@ impl Studio {
     }
 
     fn redo(&mut self) {
+        self.follow = None;
         if self.history.redo(&mut self.project) {
             self.shadow = self.project.clone();
             self.save();
@@ -413,7 +591,8 @@ impl Studio {
         self.playhead = t;
         self.seeking = Some((t, Instant::now()));
         self.reported = None;
-        bridge::send(json!({"op":"seek","time":self.project.source_time(t),"fast":fast}));
+        let (segment, source) = self.project.source_at(t);
+        bridge::send(json!({"op":"seek","time":source,"fast":fast,"segment":segment}));
     }
 
     fn add_text(&mut self) {
@@ -489,6 +668,75 @@ impl Studio {
         }
         self.snapped = found;
         found
+    }
+
+    /// First clip of the caption layer, or a centered lower caption in the default font sized for the frame's shape.
+    fn caption_template(&self) -> Clip {
+        let (w, h) = self.project.output_size(0);
+        self.project
+            .caption_layer()
+            .and_then(|l| self.project.layers[l].clips.first().cloned())
+            .unwrap_or_else(|| Clip {
+                x: 0.5,
+                y: 0.78,
+                enter: Motion::None,
+                exit: Motion::None,
+                body: Body::Text(TextStyle {
+                    font: caption::book().default_family().to_owned(),
+                    size: if w > h { 0.075 } else { 0.05 },
+                    ..TextStyle::default()
+                }),
+                ..Clip::default()
+            })
+    }
+
+    /// Rebuilds the caption layer from the transcript with the chosen grouping.
+    fn make_captions(&mut self) {
+        let Some(transcript) = &self.transcript else {
+            return;
+        };
+        let clips = speech::clips(
+            transcript,
+            self.caption_mode,
+            self.caption_words,
+            &self.caption_template(),
+            self.project.length(),
+        );
+        if let (Some(Pick::Clip(id)), Some(l)) = (self.pick, self.project.caption_layer())
+            && self.project.layers[l].clips.iter().any(|c| c.id == id)
+        {
+            self.pick = None;
+        }
+        self.project.set_captions(clips);
+    }
+
+    /// Applies `change` to every clip of the caption layer.
+    fn restyle_captions(&mut self, change: impl Fn(&mut Clip)) {
+        if let Some(l) = self.project.caption_layer() {
+            self.project.layers[l].clips.iter_mut().for_each(change);
+        }
+    }
+
+    /// Fake words across the timeline for trying captions without speech recognition.
+    fn sample_transcript(&mut self) {
+        let text = "Luma turns what you say into captions you can place anywhere on the video";
+        let length = self.project.length().max(1000);
+        let words: Vec<&str> = text.split(' ').collect();
+        let step = length / words.len() as i64;
+        self.transcript = Some(Transcript {
+            language: "en".into(),
+            words: words
+                .iter()
+                .enumerate()
+                .map(|(i, w)| speech::Word {
+                    text: (*w).into(),
+                    start: i as i64 * step,
+                    end: i as i64 * step + step * 3 / 4,
+                })
+                .collect(),
+            ranges: self.project.ranges(),
+        });
+        self.save_transcript();
     }
 
     fn sample_captions(&mut self) {
@@ -765,19 +1013,42 @@ impl Gallery {
         }
     }
 
-    fn studio_sync(&mut self, s: &mut Studio) {
-        let ranges = s.project.ranges();
-        if s.sent.as_ref() != Some(&ranges) {
-            bridge::send(json!({"op":"segments","ranges":ranges}));
-            s.sent = Some(ranges);
+    /// Reads added videos' waveforms one at a time after the opened video's.
+    fn studio_waves(&mut self, s: &mut Studio) {
+        let busy = s.wave_pending.as_ref().is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(90))
+            || (self.waveform.peaks.is_empty() && self.waveform.status.starts_with("Reading"));
+        if busy {
+            return;
         }
+        let next = s
+            .project
+            .used_sources()
+            .into_iter()
+            .find(|&n| n > 0 && !s.waves.contains_key(&s.project.sources[n].uri));
+        if let Some(n) = next {
+            let item = s.media(n);
+            s.wave_pending = Some((item.uri.clone(), Instant::now()));
+            bridge::send(json!({"op":"waveform","item":item}));
+        }
+    }
+
+    fn studio_sync(&mut self, s: &mut Studio) {
+        let sources: Vec<&str> = s.project.sources.iter().map(|v| v.uri.as_str()).collect();
+        let edit = json!({"op":"segments","ranges":s.project.ranges(),"sources":sources});
+        if s.sent.as_ref() != Some(&edit) {
+            bridge::send(edit.clone());
+            s.sent = Some(edit);
+            let t = s.playhead.min(s.project.length());
+            s.seek(t, false);
+        }
+        self.studio_waves(s);
         let playing = self.playing();
         let playback = &self.native["playback"];
         if playback["uri"] == s.item.uri.as_str()
             && let Some(source) = playback["position"].as_i64()
             && !matches!(s.grab, Some((Grab::Scrub { .. }, _)))
         {
-            let t = s.project.timeline_time(source);
+            let t = s.project.timeline_at(playback["segment"].as_u64().unwrap_or(0) as usize, source);
             if s.seeking.is_some_and(|(target, at)| {
                 (t - target).abs() <= 80 || at.elapsed() > Duration::from_millis(1500)
             }) {
@@ -875,6 +1146,12 @@ impl Gallery {
             let rest = ui.available_size();
             self.studio_lower(s, ui, rest, host);
         }
+        if let Some(before) = s.follow.take()
+            && s.clip().is_some_and(|c| c.id == before.id && *c != before)
+        {
+            s.project.follow(&before);
+        }
+        s.follow = s.clip().cloned();
         let (pointer_down, now) = ui.input(|i| (i.pointer.any_down(), i.time));
         s.settle(pointer_down, now);
         if let Some(kind) = s.haptic.take() {
@@ -963,8 +1240,20 @@ impl Gallery {
                     self.configure_video_surface(width, height);
                 }
             }
+            let shown = self.native["playback"]["segment"]
+                .as_u64()
+                .and_then(|i| s.project.segments.get(i as usize))
+                .map_or(0, |segment| segment.source);
+            let picture = match s.project.sources.get(shown) {
+                Some(video) if shown > 0 && video.width > 0 && video.height > 0 => {
+                    ui.painter().rect_filled(frame, 0, Color32::BLACK);
+                    let fit = (full.width() / video.width as f32).min(full.height() / video.height as f32);
+                    Rect::from_center_size(full.center(), vec2(video.width as f32, video.height as f32) * fit)
+                }
+                _ => full,
+            };
             if let Some(surface) = &self.gpu {
-                surface.paint(&clipped, full);
+                surface.paint(&clipped, picture);
             }
         }
         #[cfg(not(target_os = "android"))]
@@ -1001,6 +1290,8 @@ impl Gallery {
         s.frame = frame;
         let frame_px = frame.size() * ppp;
         let active = s.project.active(s.playhead);
+        let shown: Vec<u64> = active.iter().map(|&(l, c)| s.project.layers[l].clips[c].id).collect();
+        s.previews.retain(|id, _| shown.contains(id));
         let paused = !self.playing() && s.grab.is_none_or(|(g, _)| !matches!(g, Grab::Scrub { .. }));
         for (l, c) in active {
             let clip = s.project.layers[l].clips[c].clone();
@@ -1339,8 +1630,9 @@ impl Gallery {
                                 break;
                             }
                             let tile_rect = Rect::from_min_size(pos2(x0 + k as f32 * tile, r.top()), vec2(tile, r.height()));
-                            let source = ((segment.source_in + at) / 100 * 100).min((s.project.duration - 100).max(0));
-                            if let Some(texture) = self.thumb(&s.item, source) {
+                            let duration = s.project.sources.get(segment.source).map_or(0, |v| v.duration);
+                            let source = ((segment.source_in + at) / 100 * 100).min((duration - 100).max(0));
+                            if let Some(texture) = self.thumb(&s.media(segment.source), source) {
                                 let t = texture.size_vec2();
                                 let factor = (tile / t.x).max(r.height() / t.y);
                                 let uv = Rect::from_center_size(pos2(0.5, 0.5), tile_rect.size() / (t * factor));
@@ -1349,12 +1641,16 @@ impl Gallery {
                         }
                         let wave = Rect::from_min_max(pos2(r.left(), r.bottom() - 15.0), r.max);
                         film.rect_filled(wave, 0, Color32::from_black_alpha(150));
-                        if !self.waveform.peaks.is_empty() {
+                        let peaks = match segment.source {
+                            0 => Some(&self.waveform),
+                            n => s.project.sources.get(n).and_then(|v| s.waves.get(&v.uri)),
+                        };
+                        if let Some(peaks) = peaks.filter(|w| !w.peaks.is_empty()) {
                             let columns = ((x1.min(track.right()) - x0.max(track.left())) / 2.0).max(0.0) as i32;
                             for n in 0..columns {
                                 let x = x0.max(track.left()) + n as f32 * 2.0 + 1.0;
                                 let from = segment.source_in as f64 + ((x - x0) * 1000.0 / scale) as f64;
-                                let peak = self.waveform.peak(from, from + 2000.0 / scale as f64).sqrt() * 6.5;
+                                let peak = peaks.peak(from, from + 2000.0 / scale as f64).sqrt() * 6.5;
                                 film.vline(
                                     x,
                                     wave.center().y - peak..=wave.center().y + peak,
@@ -1423,6 +1719,15 @@ impl Gallery {
                 Color32::from_black_alpha(140),
             );
         }
+        s.plus = Rect::NOTHING;
+        if let Some(&(_, film)) = lanes.iter().find(|(lane, _)| *lane == Lane::Film) {
+            let plus = Rect::from_min_size(pos2(end + 8.0, film.top() + 8.0), Vec2::splat(film.height() - 16.0));
+            if track.contains_rect(plus) && body.contains_rect(plus) {
+                track_painter.rect_filled(plus, 8, Color32::from_white_alpha(235));
+                icons::image("add", BG, 24.0).paint_at(ui, Rect::from_center_size(plus.center(), Vec2::splat(24.0)));
+                s.plus = plus;
+            }
+        }
         // Headers.
         for &(lane, rect) in &lanes {
             let header = Rect::from_min_size(rect.min, vec2(HEADER - 4.0, rect.height()));
@@ -1465,7 +1770,7 @@ impl Gallery {
                         .paint_at(ui, Rect::from_center_size(toggle.center(), Vec2::splat(16.0)));
                     let response = ui.interact(toggle.intersect(body), ui.id().with("film_audio"), Sense::click());
                     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Video audio"));
-                    if response.clicked() && s.project.has_audio {
+                    if response.clicked() && s.project.has_audio() {
                         s.project.audio.keep = !keep;
                     }
                 }
@@ -1630,13 +1935,11 @@ impl Gallery {
                     s.project.set_clip_edge(id, head, t);
                 }
                 Grab::Cut { index, head, .. } => {
-                    let segments = &s.project.segments;
-                    let segment = &segments[index];
+                    let segment = &s.project.segments[index];
+                    let (floor, ceiling) = s.project.trim_bounds(index);
                     let delta = if head {
-                        let floor = index.checked_sub(1).map_or(0, |i| segments[i].source_out);
                         (segment.source_in + ms).clamp(floor, segment.source_out - MIN_CLIP) - segment.source_in
                     } else {
-                        let ceiling = segments.get(index + 1).map_or(s.project.duration, |s| s.source_in);
                         (segment.source_out + ms).clamp(segment.source_in + MIN_CLIP, ceiling) - segment.source_out
                     };
                     s.grab = Some((Grab::Cut { index, head, delta }, origin));
@@ -1665,6 +1968,14 @@ impl Gallery {
             && let Some(id) = s.armed.take()
         {
             s.pick = Some(Pick::Clip(id));
+        }
+        if response.clicked()
+            && let Some(p) = response.interact_pointer_pos()
+            && s.plus.contains(p)
+        {
+            s.panel = Panel::Videos;
+            s.append = true;
+            return;
         }
         if response.clicked()
             && let Some(p) = response.interact_pointer_pos()
@@ -1713,6 +2024,8 @@ impl Gallery {
             _ => vec![
                 ("cut", "Split", true),
                 ("text", "Text", true),
+                ("captions", "Captions", true),
+                ("video", "Video", true),
                 ("photo", "Overlay", true),
                 ("layers", "Layers", true),
                 ("fade", "Fade", true),
@@ -1739,7 +2052,12 @@ impl Gallery {
                 }
                 "Delete" => s.delete(),
                 "Text" => s.add_text(),
+                "Captions" => s.panel = Panel::Captions,
                 "Overlay" => s.panel = Panel::Photos,
+                "Video" => {
+                    s.panel = Panel::Videos;
+                    s.append = false;
+                }
                 "Layers" => s.panel = Panel::Layers,
                 "Fade" => s.panel = Panel::Fade,
                 "Audio" => s.panel = Panel::Audio,
@@ -1763,6 +2081,8 @@ impl Gallery {
             Panel::Layers => "Layers",
             Panel::Export => "Export",
             Panel::Photos => "Add overlay",
+            Panel::Videos => "Add video",
+            Panel::Captions => "Captions",
             Panel::Debug => "Debug",
             Panel::None => "",
         };
@@ -1790,6 +2110,13 @@ impl Gallery {
                 Panel::Text => self.studio_text(s, ui),
                 Panel::Style => self.studio_style(s, ui),
                 Panel::Motion => {
+                    let linked = match s.pick {
+                        Some(Pick::Clip(id)) => s.project.locate_clip(id).map(|(l, _)| &s.project.layers[l]).filter(|l| l.linked && l.clips.len() > 1).map(|l| l.clips.len()),
+                        _ => None,
+                    };
+                    if let Some(count) = linked {
+                        ui.small(format!("Applies to all {count} linked clips in this layer."));
+                    }
                     if let Some(clip) = s.clip_mut() {
                         motion_row(ui, "In", &mut clip.enter, &mut clip.enter_ms);
                         ui.add_space(6.0);
@@ -1806,8 +2133,8 @@ impl Gallery {
                 }
                 Panel::Fade => self.studio_fade(s, ui),
                 Panel::Audio => {
-                    if !s.project.has_audio {
-                        ui.label("This video has no audio track.");
+                    if !s.project.has_audio() {
+                        ui.label("No video on the timeline has an audio track.");
                         return;
                     }
                     let audio = &mut s.project.audio;
@@ -1829,6 +2156,8 @@ impl Gallery {
                 Panel::Layers => self.studio_layers(s, ui),
                 Panel::Export => self.studio_export(s, ui),
                 Panel::Photos => self.studio_photos(s, ui),
+                Panel::Videos => self.studio_videos(s, ui),
+                Panel::Captions => self.studio_captions(s, ui),
                 Panel::Debug => self.studio_debug(s, ui, host),
                 Panel::None => {}
             });
@@ -1892,6 +2221,14 @@ impl Gallery {
             ui.label("Select a caption or overlay first.");
             return;
         };
+        if let Some((l, _)) = s.project.locate_clip(clip.id)
+            && clip.text().is_some()
+            && s.project.layers[l].clips.len() > 1
+        {
+            let layer = &mut s.project.layers[l];
+            let count = layer.clips.len();
+            ui.checkbox(&mut layer.linked, format!("Apply to all {count} clips in {}", layer.name));
+        }
         match clip.body {
             Body::Text(style) => {
                 ui.label(egui::RichText::new("Font").strong());
@@ -2113,7 +2450,7 @@ impl Gallery {
             }
         }
         ui.separator();
-        let has_audio = s.project.has_audio;
+        let has_audio = s.project.has_audio();
         let segments = s.project.segments.len();
         ui.horizontal(|ui| {
             ui.add(icons::image("video", TEXT, 18.0));
@@ -2170,6 +2507,250 @@ impl Gallery {
         }
     }
 
+    fn studio_videos(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        let videos: Vec<MediaItem> = self
+            .items
+            .iter()
+            .filter(|i| i.is_video() && i.duration >= MIN_CLIP)
+            .take(240)
+            .cloned()
+            .collect();
+        if videos.is_empty() {
+            ui.label("No videos in the library. Grant video access in Settings.");
+            return;
+        }
+        ui.small(if s.append { "Adds the whole video at the end." } else { "Adds the whole video at the cut nearest the playhead." });
+        let side = ((ui.available_width() - 12.0) / 4.0).floor();
+        let mut chosen = None;
+        egui::Grid::new("studio_videos").spacing(vec2(4.0, 4.0)).show(ui, |ui| {
+            for (n, item) in videos.iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+                if ui.is_rect_visible(rect) {
+                    self.cover(ui, item, rect, 0, Color32::WHITE);
+                    let label = ui.painter().layout_no_wrap(
+                        timecode(item.duration, false),
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                    let tag = Rect::from_min_size(rect.max - label.size() - vec2(8.0, 6.0), label.size() + vec2(6.0, 2.0));
+                    ui.painter().rect_filled(tag, 3, Color32::from_black_alpha(170));
+                    ui.painter().galley(tag.min + vec2(3.0, 1.0), label, Color32::WHITE);
+                }
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &item.name));
+                if response.clicked() {
+                    chosen = Some(item.clone());
+                }
+                if n % 4 == 3 {
+                    ui.end_row();
+                }
+            }
+        });
+        if let Some(item) = chosen
+            && !s.add_video(&item)
+        {
+            self.notice("This video's length is unknown");
+        }
+    }
+
+    fn studio_captions(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
+        if !s.project.has_audio() {
+            ui.label("No video on the timeline has an audio track to transcribe.");
+            return;
+        }
+        if s.language.is_empty() {
+            let locale = self.native["locale"].as_str().unwrap_or_default();
+            s.language = speech::LANGUAGES
+                .iter()
+                .find(|(code, _)| *code == locale)
+                .map_or("auto", |(code, _)| code)
+                .into();
+        }
+        let busy = self.native["speech_busy"] == true;
+        ui.horizontal(|ui| {
+            ui.label("Spoken language");
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("speech_language")
+                    .selected_text(speech::language_name(&s.language))
+                    .show_ui(ui, |ui| {
+                        for (code, name) in speech::LANGUAGES {
+                            ui.selectable_value(&mut s.language, code.to_owned(), name);
+                        }
+                    });
+            });
+        });
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(self.native["speech_status"].as_str().unwrap_or("Transcribing"));
+            });
+            let progress = self.native["speech_progress"].as_f64().unwrap_or(0.0) as f32;
+            ui.add(egui::ProgressBar::new(progress).show_percentage());
+            if ui.button("Cancel").clicked() {
+                bridge::send(json!({"op":"cancel_transcribe"}));
+            }
+        } else {
+            let label = match (self.native["speech_model"] == true, s.transcript.is_some()) {
+                (false, _) => "Download speech model (57 MB) and transcribe",
+                (true, false) => "Transcribe audio",
+                (true, true) => "Transcribe again",
+            };
+            if ui
+                .add(egui::Button::image_and_text(icons::image("captions", ACCENT, 20.0), label).min_size(vec2(200.0, 44.0)))
+                .clicked()
+            {
+                self.studio_transcribe(s);
+            }
+            if !s.speech_error.is_empty() {
+                ui.colored_label(ACCENT, &s.speech_error);
+            }
+        }
+        let Some(transcript) = s.transcript.clone() else {
+            ui.small("Speech is recognized on this phone; nothing is uploaded.");
+            return;
+        };
+        ui.small(format!(
+            "{} words · {}",
+            transcript.words.len(),
+            speech::language_name(&transcript.language)
+        ));
+        if transcript.ranges != s.project.ranges() {
+            ui.colored_label(ACCENT, "The video was edited after transcribing. Transcribe again so the words line up.");
+        }
+        if transcript.words.is_empty() {
+            ui.label("No speech was recognized.");
+            return;
+        }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            for (mode, label) in [
+                (CaptionMode::Phrases, "Phrases"),
+                (CaptionMode::Words, "One word"),
+                (CaptionMode::Highlight, "Highlight word"),
+            ] {
+                if ui.add(egui::Button::new(label).selected(s.caption_mode == mode)).clicked() {
+                    s.caption_mode = mode;
+                }
+            }
+        });
+        ui.add_enabled(
+            s.caption_mode != CaptionMode::Words,
+            egui::Slider::new(&mut s.caption_words, 2..=8).text("Max words"),
+        );
+        let layer = s.project.caption_layer();
+        let made = layer.is_some_and(|l| !s.project.layers[l].clips.is_empty());
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(if made { "Update captions" } else { "Add captions" }).min_size(vec2(150.0, 40.0)))
+                .clicked()
+            {
+                s.make_captions();
+            }
+            if let Some(l) = layer
+                && ui.button("Remove captions").clicked()
+            {
+                if s.project.layers[l].clips.iter().any(|c| s.pick == Some(Pick::Clip(c.id))) {
+                    s.pick = None;
+                }
+                s.project.layers.remove(l);
+            }
+        });
+        if made {
+            let template = s.caption_template();
+            let Some(style) = template.text().cloned() else {
+                return;
+            };
+            ui.label(egui::RichText::new("Position").strong());
+            ui.horizontal(|ui| {
+                for (label, y) in [("Top", 0.15), ("Middle", 0.5), ("Bottom", 0.8)] {
+                    if ui.add(egui::Button::new(label).selected((template.y - y).abs() < 0.01)).clicked() {
+                        s.restyle_captions(|c| (c.x, c.y) = (0.5, y));
+                    }
+                }
+            });
+            let mut y = template.y;
+            if ui.add(egui::Slider::new(&mut y, 0.05..=0.95).text("Height").custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed() {
+                s.restyle_captions(|c| c.y = y);
+            }
+            let mut size = style.size;
+            if ui.add(egui::Slider::new(&mut size, 0.02..=0.15).text("Size").custom_formatter(|v, _| format!("{:.1}%", v * 100.0))).changed() {
+                s.restyle_captions(|c| {
+                    if let Some(t) = c.text_mut() {
+                        t.size = size;
+                    }
+                });
+            }
+            let mut chosen = None;
+            egui::ScrollArea::horizontal().id_salt("caption_presets").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (name, preset) in presets() {
+                        let sample = TextStyle {
+                            text: "Aa".into(),
+                            font: style.font.clone(),
+                            size: 0.2,
+                            ..preset.clone()
+                        };
+                        let tile = s.tile(ui.ctx(), format!("preset:{name}:{}", style.font), &sample);
+                        let (rect, response) = ui.allocate_exact_size(vec2(66.0, 50.0), Sense::click());
+                        ui.painter().rect_filled(rect, 6, Color32::from_gray(48));
+                        let size = tile.size_vec2();
+                        let fit = (58.0 / size.x).min(34.0 / size.y).min(1.0);
+                        ui.painter().image(
+                            tile.id(),
+                            Rect::from_center_size(rect.center() - vec2(0.0, 5.0), size * fit),
+                            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        ui.painter().text(rect.center_bottom() - vec2(0.0, 2.0), Align2::CENTER_BOTTOM, name, FontId::proportional(9.0), MUTED);
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                        if response.clicked() {
+                            chosen = Some(preset);
+                        }
+                    }
+                });
+            });
+            if let Some(preset) = chosen {
+                s.restyle_captions(|c| {
+                    if let Some(t) = c.text_mut() {
+                        t.apply_preset(&preset);
+                    }
+                });
+            }
+            if layer.is_some_and(|l| s.project.layers[l].clips.iter().any(|c| c.text().is_some_and(|t| t.highlight.is_some()))) {
+                ui.label(egui::RichText::new("Highlight color").strong());
+                let mut color = style.highlight_color;
+                if swatches(ui, &mut color) {
+                    s.restyle_captions(|c| {
+                        if let Some(t) = c.text_mut() {
+                            t.highlight_color = color;
+                        }
+                    });
+                }
+            }
+            ui.small("Drag any caption on the video to move them all. Tap one to fix its words; Style changes every caption.");
+        }
+        ui.separator();
+        let words: Vec<&str> = transcript.words.iter().map(|w| w.text.as_str()).collect();
+        let text = words.join(if speech::spaced(&transcript.language) { " " } else { "" });
+        ui.add(egui::Label::new(egui::RichText::new(text).small().color(MUTED)).wrap());
+    }
+
+    fn studio_transcribe(&mut self, s: &mut Studio) {
+        let Some(job) = compose::speech_job(&s.project) else {
+            self.notice("No video on the timeline has audio");
+            return;
+        };
+        let sources: Vec<&str> = s.project.sources.iter().map(|v| v.uri.as_str()).collect();
+        s.heard = Some(s.project.ranges());
+        s.speech_error.clear();
+        bridge::send(json!({
+            "op":"transcribe",
+            "args":job.args,
+            "sources":sources,
+            "duration":job.duration,
+            "language":s.language,
+        }));
+    }
+
     fn studio_export(&mut self, s: &mut Studio, ui: &mut egui::Ui) {
         let original = s.project.output_size(0);
         ui.label(egui::RichText::new("Resolution").strong());
@@ -2195,7 +2776,7 @@ impl Gallery {
             "{} · {w} x {h} · {} overlay(s) · audio {}",
             timecode(s.project.length(), true),
             overlays,
-            if s.project.has_audio && s.project.audio.keep { "on" } else { "off" }
+            if s.project.has_audio() && s.project.audio.keep { "on" } else { "off" }
         ));
         let pending = s
             .project
@@ -2207,11 +2788,15 @@ impl Gallery {
         if pending {
             ui.colored_label(ACCENT, "A photo overlay is still loading.");
         }
+        let probing = s.project.used_sources().iter().any(|&n| !s.project.sources[n].probed);
+        if probing {
+            ui.colored_label(ACCENT, "Reading an added video's details.");
+        }
         let busy = self.native["exporting"] == true || s.export.is_some();
         ui.add_space(8.0);
         if ui
             .add_enabled(
-                !busy && !pending,
+                !busy && !pending && !probing,
                 egui::Button::image_and_text(icons::image("save", ACCENT, 20.0), "Export video").min_size(vec2(180.0, 44.0)),
             )
             .clicked()
@@ -2256,14 +2841,27 @@ impl Gallery {
 
     fn studio_debug(&mut self, s: &mut Studio, ui: &mut egui::Ui, host: &Host) {
         ui.checkbox(&mut s.hit_boxes, "Show overlay boxes and frame bounds");
-        let source = s.project.source_time(s.playhead);
+        let (segment, source) = s.project.source_at(s.playhead);
         ui.small(format!(
-            "Playhead {} -> source {}  ·  player {}",
+            "Playhead {} -> segment {segment} source {}  ·  player {} in segment {}",
             timecode(s.playhead, true),
             timecode(source, true),
-            timecode(self.native["playback"]["position"].as_i64().unwrap_or(0), true)
+            timecode(self.native["playback"]["position"].as_i64().unwrap_or(0), true),
+            self.native["playback"]["segment"]
         ));
-        ui.small(format!("Ranges {:?}", s.project.ranges()));
+        ui.small(format!("Ranges [in, out, source] {:?}", s.project.ranges()));
+        for (n, video) in s.project.sources.iter().enumerate() {
+            ui.small(format!(
+                "Source {n}: {} · {} · {}x{} · audio {} · probed {} · waveform {}",
+                video.name,
+                timecode(video.duration, true),
+                video.width,
+                video.height,
+                video.has_audio,
+                video.probed,
+                if n == 0 { "viewer".into() } else { s.waves.get(&video.uri).map_or("none".into(), |w| format!("{} peaks {}", w.peaks.len(), w.status)) }
+            ));
+        }
         ui.small(format!(
             "Previews {} · renders {} · last {:.1} ms · tiles {}",
             s.previews.len(),
@@ -2278,18 +2876,22 @@ impl Gallery {
             book.default_family()
         ));
         ui.small(format!("Scale {:.0} pt/s · fps {} · {}", s.scale, s.fps, s.project.name));
+        ui.small(format!(
+            "Speech: model {} · busy {} · {} · transcript {} · error {}",
+            self.native["speech_model"],
+            self.native["speech_busy"],
+            self.native["speech_status"].as_str().unwrap_or_default(),
+            s.transcript.as_ref().map_or("none".into(), |t| format!("{} words {} {}", t.words.len(), t.language, if t.ranges == s.project.ranges() { "current" } else { "stale" })),
+            s.speech_error
+        ));
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy project JSON").clicked() {
                 host.copy_text(serde_json::to_string_pretty(&s.project).unwrap_or_default());
             }
             if ui.button("Copy FFmpeg command").clicked() {
-                let overlays: Vec<compose::Overlay> = s
-                    .project
-                    .layers
-                    .iter()
-                    .filter(|l| l.visible)
-                    .flat_map(|l| &l.clips)
-                    .map(|c| compose::Overlay { path: format!("{}.png", c.id), clip: c.clone() })
+                let overlays: Vec<compose::Overlay> = (0..s.project.layers.len())
+                    .filter(|&l| s.project.layers[l].visible && !s.project.layers[l].clips.is_empty())
+                    .map(|l| compose::Overlay { list: format!("layer{l}.ffconcat"), x: 0, y: 0 })
                     .collect();
                 let job = compose::job(
                     &s.project,
@@ -2301,17 +2903,25 @@ impl Gallery {
             if ui.button("Add sample captions").clicked() {
                 s.sample_captions();
             }
+            if ui.button("Sample transcript").clicked() {
+                s.sample_transcript();
+                s.panel = Panel::Captions;
+            }
+            if ui.button("Copy transcript JSON").clicked() {
+                host.copy_text(serde_json::to_string_pretty(&s.transcript).unwrap_or_default());
+            }
+            if self.native["speech_model"] == true && ui.button("Delete speech model").clicked() {
+                bridge::send(json!({"op":"speech_model_delete"}));
+            }
             if ui.button("Clear overlays").clicked() {
                 s.project.layers.clear();
                 s.pick = None;
             }
             if ui.button("Reset project").clicked() {
-                let fresh = Project::new(&s.item.uri, &s.item.name, s.project.duration, s.project.width, s.project.height);
-                s.project = Project {
-                    fps: s.project.fps,
-                    has_audio: s.project.has_audio,
-                    ..fresh
-                };
+                let primary = s.project.sources[0].clone();
+                let mut fresh = Project::new(&s.item.uri, &s.item.name, primary.duration, s.project.width, s.project.height);
+                fresh.set_primary(primary);
+                s.project = Project { fps: s.project.fps, ..fresh };
                 s.pick = None;
             }
         });
@@ -2321,7 +2931,7 @@ impl Gallery {
     }
 }
 
-/// Renders every visible overlay at output size and returns the export command.
+/// Renders every visible overlay layer into a frame track at output size and returns the export command.
 fn studio_job(
     project: &Project,
     pictures: &HashMap<String, Arc<RgbaImage>>,
@@ -2330,42 +2940,187 @@ fn studio_job(
     uri: String,
     name: String,
 ) -> Result<Value, String> {
-    let (w, h) = project.output_size(settings.max_height);
+    let size = project.output_size(settings.max_height);
     let mut overlays = vec![];
-    for layer in project.layers.iter().filter(|l| l.visible) {
-        for clip in layer.clips.iter().filter(|c| c.start < project.length()) {
-            let rendered = match &clip.body {
-                Body::Text(style) => caption::render_text(style, w as f32, h as f32),
-                Body::Picture(picture) => {
-                    let source = match pictures.get(&picture.path) {
-                        Some(image) => image.clone(),
-                        None => Arc::new(
-                            image::open(&picture.path)
-                                .map_err(|_| format!("Photo overlay {} is unavailable", picture.name))?
-                                .to_rgba8(),
-                        ),
-                    };
-                    caption::render_picture(picture, &source, w as f32)
-                }
-            };
-            if rendered.image.width() <= 2 {
-                continue;
-            }
-            let image = if clip.rotation.abs() > 0.01 || clip.opacity < 0.999 {
-                caption::transform(&rendered.image, clip.rotation, clip.opacity)
-            } else {
-                rendered.image
-            };
-            let path = render.join(format!("{}.png", clip.id));
-            image.save(&path).map_err(|e| format!("Could not write an overlay: {e}"))?;
-            overlays.push(compose::Overlay {
-                path: path.to_string_lossy().into_owned(),
-                clip: clip.clone(),
-            });
+    for layer in (0..project.layers.len()).filter(|&l| project.layers[l].visible) {
+        if let Some(track) = layer_track(project, layer, pictures, size, rate(&settings.fps), render)? {
+            overlays.push(track);
         }
     }
     let job = compose::job(project, &overlays, settings);
-    Ok(json!({"op":"studio_export","uri":uri,"name":name,"args":job.args,"duration":job.duration}))
+    let sources: Vec<&str> = project.sources.iter().map(|v| v.uri.as_str()).collect();
+    Ok(json!({"op":"studio_export","uri":uri,"name":name,"sources":sources,"args":job.args,"duration":job.duration}))
+}
+
+/// Frames per second of FFmpeg rational text such as "30000/1001".
+fn rate(text: &str) -> f64 {
+    let mut parts = text.split('/').map(|p| p.trim().parse::<f64>().unwrap_or(0.0));
+    let (n, d) = (parts.next().unwrap_or(0.0), parts.next().unwrap_or(1.0));
+    if n > 0.0 && d > 0.0 { (n / d).clamp(1.0, 240.0) } else { 30.0 }
+}
+
+/// A clip's image shown from `from` until `to` with its top left at `x`,`y` output pixels.
+struct Shot {
+    clip: usize,
+    x: i64,
+    y: i64,
+    alpha: f32,
+    from: i64,
+    to: i64,
+}
+
+/// A clip at output size with rotation and opacity baked in; `None` when it draws nothing.
+fn draw_clip(clip: &Clip, pictures: &HashMap<String, Arc<RgbaImage>>, (w, h): (u32, u32)) -> Result<Option<RgbaImage>, String> {
+    let rendered = match &clip.body {
+        Body::Text(style) => caption::render_text(style, w as f32, h as f32),
+        Body::Picture(picture) => {
+            let source = match pictures.get(&picture.path) {
+                Some(image) => image.clone(),
+                None => Arc::new(
+                    image::open(&picture.path)
+                        .map_err(|_| format!("Photo overlay {} is unavailable", picture.name))?
+                        .to_rgba8(),
+                ),
+            };
+            caption::render_picture(picture, &source, w as f32)
+        }
+    };
+    if rendered.image.width() <= 2 {
+        return Ok(None);
+    }
+    Ok(Some(if clip.rotation.abs() > 0.01 || clip.opacity < 0.999 {
+        caption::transform(&rendered.image, clip.rotation, clip.opacity)
+    } else {
+        rendered.image
+    }))
+}
+
+fn save_png(image: &RgbaImage, path: &std::path::Path) -> Result<(), String> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let file = std::fs::File::create(path).map_err(|e| format!("Could not write an overlay: {e}"))?;
+    PngEncoder::new_with_quality(std::io::BufWriter::new(file), CompressionType::Fast, FilterType::Adaptive)
+        .write_image(image.as_raw(), image.width(), image.height(), image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("Could not write an overlay: {e}"))
+}
+
+/// Copies `image` onto `canvas` at `x`,`y` with its alpha scaled by `alpha`.
+fn paste(canvas: &mut RgbaImage, image: &RgbaImage, x: i64, y: i64, alpha: f32) {
+    if alpha >= 0.999 {
+        image::imageops::replace(canvas, image, x, y);
+        return;
+    }
+    let (cw, ch) = (canvas.width() as i64, canvas.height() as i64);
+    for (ix, iy, pixel) in image.enumerate_pixels() {
+        let (cx, cy) = (x + ix as i64, y + iy as i64);
+        if pixel[3] > 0 && (0..cw).contains(&cx) && (0..ch).contains(&cy) {
+            let mut faded = *pixel;
+            faded[3] = (pixel[3] as f32 * alpha).round() as u8;
+            canvas.put_pixel(cx as u32, cy as u32, faded);
+        }
+    }
+}
+
+/// Writes one layer as an ffconcat track of frames the size of everything it shows; moving clips get a frame per output frame.
+fn layer_track(
+    project: &Project,
+    layer: usize,
+    pictures: &HashMap<String, Arc<RgbaImage>>,
+    (w, h): (u32, u32),
+    fps: f64,
+    render: &std::path::Path,
+) -> Result<Option<compose::Overlay>, String> {
+    let length = project.length();
+    let clips: Vec<&Clip> = project.layers[layer].clips.iter().filter(|c| c.start < length).collect();
+    let step = 1000.0 / fps;
+    // Floored output frame times in [from, to).
+    let grid = |from: i64, to: i64| {
+        let mut k = (from as f64 / step).ceil() as i64;
+        let mut times = vec![];
+        while (k as f64 * step) < to as f64 {
+            times.push((k as f64 * step).floor() as i64);
+            k += 1;
+        }
+        times
+    };
+    // Images stay in memory up to 96 MB in total and are drawn again past that.
+    let mut budget = 96usize << 20;
+    let mut kept: Vec<Option<RgbaImage>> = vec![];
+    let mut shots = vec![];
+    let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for (n, clip) in clips.iter().enumerate() {
+        let Some(image) = draw_clip(clip, pictures, (w, h))? else {
+            kept.push(None);
+            continue;
+        };
+        let (iw, ih) = (image.width() as i64, image.height() as i64);
+        let end = clip.end.min(length);
+        let (enter, exit) = clip.motion_ms();
+        let mut times = vec![clip.start];
+        if enter > 0 {
+            times.extend(grid(clip.start, clip.start + enter));
+            times.push(clip.start + enter);
+        }
+        if exit > 0 {
+            times.push(end - exit);
+            times.extend(grid(end - exit, end));
+        }
+        times.retain(|&t| t >= clip.start && t < end);
+        times.sort_unstable();
+        times.dedup();
+        for (k, &from) in times.iter().enumerate() {
+            let to = times.get(k + 1).copied().unwrap_or(end);
+            let sample = (((from as f64 / step).ceil() * step).round() as i64).clamp(clip.start, end - 1);
+            let (alpha, dx, dy) = clip.envelope(sample);
+            if alpha < 0.004 {
+                continue;
+            }
+            let x = ((clip.x + dx) * w as f32 - iw as f32 / 2.0).round() as i64;
+            let y = ((clip.y + dy) * h as f32 - ih as f32 / 2.0).round() as i64;
+            (left, top, right, bottom) = (left.min(x), top.min(y), right.max(x + iw), bottom.max(y + ih));
+            shots.push(Shot { clip: n, x, y, alpha, from, to });
+        }
+        let bytes = image.as_raw().len();
+        kept.push((bytes <= budget).then(|| {
+            budget -= bytes;
+            image
+        }));
+    }
+    let (left, top) = (left.max(0) & !1, top.max(0) & !1);
+    let (right, bottom) = (right.min(w as i64), bottom.min(h as i64));
+    if shots.is_empty() || right - left < 2 || bottom - top < 2 {
+        return Ok(None);
+    }
+    let (bw, bh) = ((right - left) as u32, (bottom - top) as u32);
+    let mut frames = vec![];
+    let mut drawn: Option<(usize, RgbaImage)> = None;
+    for (i, shot) in shots.iter().enumerate() {
+        let image = match &kept[shot.clip] {
+            Some(image) => image,
+            None => {
+                if drawn.as_ref().is_none_or(|(n, _)| *n != shot.clip) {
+                    let image = draw_clip(clips[shot.clip], pictures, (w, h))?.unwrap_or_default();
+                    drawn = Some((shot.clip, image));
+                }
+                &drawn.as_ref().expect("drawn above").1
+            }
+        };
+        let mut canvas = RgbaImage::new(bw, bh);
+        paste(&mut canvas, image, shot.x - left, shot.y - top, shot.alpha);
+        let name = format!("layer{layer}-{i}.png");
+        save_png(&canvas, &render.join(&name))?;
+        frames.push((name, shot.from, shot.to));
+    }
+    let blank = format!("layer{layer}-blank.png");
+    save_png(&RgbaImage::new(bw, bh), &render.join(&blank))?;
+    let list = render.join(format!("layer{layer}.ffconcat"));
+    std::fs::write(&list, compose::track_list(&frames, &blank, length))
+        .map_err(|e| format!("Could not write an overlay list: {e}"))?;
+    Ok(Some(compose::Overlay {
+        list: list.to_string_lossy().into_owned(),
+        x: left as i32,
+        y: top as i32,
+    }))
 }
 
 #[cfg(test)]
@@ -2582,10 +3337,14 @@ mod tests {
         studio.project.split(5000);
         studio.project.remove_segment(1);
         let uri = studio.item.uri.clone();
-        rig.gallery.native = json!({"playback":{"uri":uri,"position":7500,"playing":false}});
+        rig.frame(vec![]);
+        let sent = rig.studio().sent.clone().expect("edit sent");
+        assert_eq!(sent["ranges"], json!([[0, 3000, 0], [5000, 10_000, 0]]));
+        assert_eq!(sent["sources"], json!([uri]));
+        rig.studio().seeking = None;
+        rig.gallery.native = json!({"playback":{"uri":uri,"position":7500,"segment":1,"playing":false}});
         rig.frame(vec![]);
         assert_eq!(rig.studio().playhead, 5500);
-        assert_eq!(rig.studio().sent.as_deref(), Some(&[[0, 3000], [5000, 10_000]][..]));
     }
 
     #[test]
@@ -2601,6 +3360,89 @@ mod tests {
         assert!(rig.gallery.studio.is_none());
         rig.gallery.open_studio();
         assert!(rig.studio().project.clip(id).is_some(), "Project restored");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transcribed_words_become_captions_that_move_together_and_reopen() {
+        let dir = std::env::temp_dir().join(format!("luma-words-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rig = Rig::new();
+        rig.gallery.preferences = Some(dir.join("luma-favorites.json"));
+        rig.gallery.studio = None;
+        rig.gallery.open_studio();
+        rig.frame(vec![]);
+        let json = dir.join("speech.json");
+        let token = |text: &str, from: i64, to: i64| json!({"text": text, "offsets": {"from": from, "to": to}});
+        let output = json!({"result": {"language": "en"}, "transcription": [{"tokens": [
+            token(" Hello", 200, 600), token(" there", 650, 1000), token(" friend", 1100, 1500),
+            token(" see", 4000, 4300), token(" you", 4350, 4600),
+        ]}]});
+        std::fs::write(&json, output.to_string()).unwrap();
+        rig.studio().event(&json!({"type": "transcript", "path": json.to_str().unwrap()}));
+        assert!(!json.exists(), "Recognizer output is removed after reading");
+        let transcript = rig.studio().transcript.clone().expect("transcript");
+        assert_eq!((transcript.words.len(), transcript.ranges.clone()), (5, rig.studio().project.ranges()));
+        rig.studio().caption_mode = CaptionMode::Highlight;
+        rig.studio().make_captions();
+        let layer = rig.studio().project.caption_layer().unwrap();
+        let clips = rig.studio().project.layers[layer].clips.clone();
+        assert_eq!(clips.len(), 5);
+        assert_eq!(clips[1].text().unwrap().text, "Hello there friend");
+        assert_eq!(clips[1].text().unwrap().highlight, Some([6, 11]));
+        rig.studio().seek(700, false);
+        rig.idle(0.6);
+        let hit = *rig.studio().hits.iter().find(|h| h.id == clips[1].id).expect("caption on stage");
+        rig.drag(hit.center, hit.center + vec2(0.0, -120.0));
+        rig.idle(0.6);
+        let ys: Vec<f32> = rig.studio().project.layers[layer].clips.iter().map(|c| c.y).collect();
+        assert!(ys[1] < 0.6 && ys.iter().all(|y| (y - ys[1]).abs() < 1e-6), "All captions moved: {ys:?}");
+        rig.gallery.back();
+        rig.gallery.open_studio();
+        assert_eq!(rig.studio().transcript.as_ref().map(|t| t.words.len()), Some(5), "Transcript restored");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_draws_each_layer_as_one_track_with_fades_baked_per_frame() {
+        let dir = std::env::temp_dir().join(format!("luma-tracks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::new("content://video/1", "Clip.mp4", 10_000, 1280, 720);
+        let words = |text: &str| Clip {
+            body: Body::Text(TextStyle {
+                text: text.into(),
+                ..TextStyle::default()
+            }),
+            ..Clip::default()
+        };
+        project.set_captions(vec![
+            Clip { start: 0, end: 500, ..words("one") },
+            Clip { start: 500, end: 1000, ..words("two") },
+            Clip { start: 2000, end: 2500, x: 0.2, ..words("three") },
+        ]);
+        project.add_layer(LayerKind::Text);
+        project.layers[1].clips.push(Clip {
+            id: 99,
+            start: 3000,
+            end: 4000,
+            enter: Motion::Fade,
+            enter_ms: 400,
+            ..words("Title")
+        });
+        let settings = compose::Settings { max_height: 0, crf: 20, fps: "30".into() };
+        let job = studio_job(&project, &HashMap::new(), &settings, &dir, "u".into(), "n".into()).unwrap();
+        let args: Vec<String> = serde_json::from_value(job["args"].clone()).unwrap();
+        assert_eq!(args.iter().filter(|a| *a == "concat").count(), 2, "One input per layer");
+        let captions = std::fs::read_to_string(dir.join("layer0.ffconcat")).unwrap();
+        assert_eq!(captions.matches("file 'layer0-").count(), 5, "Three words and two gaps: {captions}");
+        let title = std::fs::read_to_string(dir.join("layer1.ffconcat")).unwrap();
+        let frames: Vec<&str> = title.lines().filter_map(|l| l.strip_prefix("file '")).map(|f| f.trim_end_matches('\'')).collect();
+        assert_eq!(frames.len(), 1 + 11 + 1 + 1, "Blank, 11 visible fade frames at 30 fps, the still title, blank: {title}");
+        let alpha = |name: &str| image::open(dir.join(name)).unwrap().to_rgba8().pixels().map(|p| p[3]).max().unwrap();
+        let fading: Vec<u8> = frames[1..12].iter().map(|f| alpha(f)).collect();
+        assert!(fading.windows(2).all(|w| w[0] < w[1]) && fading[0] < 40 && alpha(frames[12]) == 255, "{fading:?}");
+        let (w0, w1) = (image::open(dir.join(frames[1])).unwrap(), image::open(dir.join("layer0-0.png")).unwrap());
+        assert!(w0.width() < 1280 && w1.width() > 400, "Frames cover only what the layer shows");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

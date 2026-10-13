@@ -65,7 +65,8 @@ pub fn source(name: &str) -> &'static [u8] {
         "fade",
         "align_left",
         "align_center",
-        "align_right"
+        "align_right",
+        "captions"
     )
 }
 

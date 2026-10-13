@@ -117,22 +117,48 @@ final class MediaFiles {
         return item.optString("name").toLowerCase(Locale.ROOT).endsWith(".dng");
     }
 
+    private static final java.util.regex.Pattern SOURCE = java.util.regex.Pattern.compile("\\{source(\\d*)\\}");
+
+    /** Replaces `{sourceN}` with descriptors of `uris` (opened into `opened` for the caller to close) and `{output}` with `output`. */
+    List<String> command(JSONArray args, JSONArray uris, String fallback, Map<Integer, Source> opened, String output) throws Exception {
+        List<String> command = new ArrayList<>();
+        for (int i = 0; i < args.length(); i++) {
+            String arg = args.getString(i);
+            java.util.regex.Matcher input = SOURCE.matcher(arg);
+            if (input.matches()) {
+                int n = input.group(1).isEmpty() ? 0 : Integer.parseInt(input.group(1));
+                String uri = uris != null && n < uris.length() ? uris.getString(n) : fallback;
+                if (!opened.containsKey(n)) opened.put(n, source(uri));
+                command.add(opened.get(n).path);
+            } else command.add("{output}".equals(arg) ? output : arg);
+        }
+        return command;
+    }
+
     String executable(String tool) { return new File(context.getApplicationInfo().nativeLibraryDir, "lib" + tool + "_exec.so").getAbsolutePath(); }
 
     String run(String tool, List<String> args, int seconds, AtomicReference<Process> running,
                Consumer<String> lineConsumer) throws Exception {
         List<String> command = new ArrayList<>();
         command.add(executable(tool));
-        int input = -1;
         String descriptorPrefix = "/proc/" + android.os.Process.myPid() + "/fd/";
+        List<Integer> inputs = new ArrayList<>();
+        for (String arg : args) if (arg.startsWith(descriptorPrefix)) inputs.add(Integer.parseInt(arg.substring(descriptorPrefix.length())));
+        int[] from = new int[inputs.size()], to = new int[inputs.size()];
+        int above = Collections.max(inputs.isEmpty() ? Collections.singletonList(2) : inputs);
         for (String arg : args) {
-            if (arg.startsWith(descriptorPrefix)) {
-                input = Integer.parseInt(arg.substring(descriptorPrefix.length()));
-                command.add(tool.equals("raw") || tool.equals("dng") ? "-" : "fd:");
+            if (!arg.startsWith(descriptorPrefix)) { command.add(arg); continue; }
+            int k = inputs.indexOf(Integer.parseInt(arg.substring(descriptorPrefix.length())));
+            from[k] = inputs.get(k); to[k] = k == 0 ? 0 : above + k;
+            if (k == 0) command.add(tool.equals("raw") || tool.equals("dng") ? "-" : "fd:");
+            else {
+                // Further descriptors are named by the fd protocol's -fd option before their -i.
+                command.add(command.size() - 1, "-fd");
+                command.add(command.size() - 1, String.valueOf(to[k]));
+                command.add("fd:");
             }
-            else command.add(arg);
         }
-        Process process = new MediaProcess(command, input);
+        Process process = new MediaProcess(command, from, to);
         if (running != null) running.set(process);
         ScheduledFuture<?> timeout = watchdog.schedule(process::destroyForcibly, seconds, TimeUnit.SECONDS);
         StringBuilder result = new StringBuilder();

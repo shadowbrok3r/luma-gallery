@@ -1,5 +1,4 @@
 #include <jni.h>
-#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,7 +11,7 @@
 extern char **environ;
 
 extern "C" JNIEXPORT jintArray JNICALL
-Java_app_luma_gallery_MediaProcess_spawn(JNIEnv *env, jclass, jobjectArray arguments, jint input) {
+Java_app_luma_gallery_MediaProcess_spawn(JNIEnv *env, jclass, jobjectArray arguments, jintArray inputs, jintArray targets) {
     std::vector<std::string> strings;
     for (int i = 0; i < env->GetArrayLength(arguments); ++i) {
         auto value = static_cast<jstring>(env->GetObjectArrayElement(arguments, i));
@@ -24,20 +23,31 @@ Java_app_luma_gallery_MediaProcess_spawn(JNIEnv *env, jclass, jobjectArray argum
     std::vector<char *> argv;
     for (auto &s : strings) argv.push_back(s.data());
     argv.push_back(nullptr);
+    std::vector<jint> from(env->GetArrayLength(inputs)), to(from.size());
+    env->GetIntArrayRegion(inputs, 0, static_cast<jsize>(from.size()), from.data());
+    env->GetIntArrayRegion(targets, 0, static_cast<jsize>(to.size()), to.data());
     int pipefd[2];
     int error = pipe2(pipefd, O_CLOEXEC) ? errno : 0;
     pid_t pid = -1;
     if (!error) {
-        posix_spawn_file_actions_t actions;
-        posix_spawn_file_actions_init(&actions);
-        if (input >= 0) posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO);
-        else posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-        posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-        posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
-        posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-        posix_spawn_file_actions_addclose(&actions, pipefd[1]);
-        error = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), environ);
-        posix_spawn_file_actions_destroy(&actions);
+        pid = fork();
+        if (pid == 0) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            // Targets are stdin or above every input descriptor.
+            bool input = false;
+            for (size_t i = 0; i < from.size(); ++i) {
+                dup2(from[i], to[i]);
+                input = input || to[i] == STDIN_FILENO;
+            }
+            if (!input) {
+                int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                if (null >= 0 && null != STDIN_FILENO) dup2(null, STDIN_FILENO);
+            }
+            execve(argv[0], argv.data(), environ);
+            _exit(127);
+        }
+        error = pid < 0 ? errno : 0;
         close(pipefd[1]);
         if (error) close(pipefd[0]);
     }

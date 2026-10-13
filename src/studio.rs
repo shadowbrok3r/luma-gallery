@@ -1,4 +1,4 @@
-//! Video edit projects: ordered segments of one source plus overlay layers above it.
+//! Video edit projects: ordered segments of source videos plus overlay layers above them.
 use crate::edit::Crop;
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,9 @@ pub struct TextStyle {
     pub line_height: f32,
     /// Maximum line width as a fraction of the frame width.
     pub wrap: f32,
+    /// Character range drawn in `highlight_color`.
+    pub highlight: Option<[usize; 2]>,
+    pub highlight_color: [u8; 4],
 }
 
 impl Default for TextStyle {
@@ -106,6 +109,8 @@ impl Default for TextStyle {
             spacing: 0.0,
             line_height: 1.0,
             wrap: 0.86,
+            highlight: None,
+            highlight_color: [255, 221, 0, 255],
         }
     }
 }
@@ -201,6 +206,8 @@ impl TextStyle {
             self.wrap,
             self.italic,
             self.underline,
+            self.highlight,
+            self.highlight_color,
         );
         *self = preset.clone();
         (
@@ -211,6 +218,8 @@ impl TextStyle {
             self.wrap,
             self.italic,
             self.underline,
+            self.highlight,
+            self.highlight_color,
         ) = keep;
     }
 }
@@ -258,6 +267,8 @@ pub struct Clip {
     pub enter_ms: i64,
     pub exit: Motion,
     pub exit_ms: i64,
+    /// Clips of a layer with the same nonzero phrase show one caption line word by word.
+    pub phrase: u64,
     pub body: Body,
 }
 
@@ -275,6 +286,7 @@ impl Default for Clip {
             enter_ms: 400,
             exit: Motion::None,
             exit_ms: 400,
+            phrase: 0,
             body: Body::default(),
         }
     }
@@ -373,6 +385,10 @@ pub struct Layer {
     pub visible: bool,
     pub locked: bool,
     pub color: usize,
+    /// Made from a transcript.
+    pub captions: bool,
+    /// Placement, style and animation edits to one clip apply to every clip.
+    pub linked: bool,
     /// Sorted by start; never overlapping.
     pub clips: Vec<Clip>,
 }
@@ -383,10 +399,29 @@ impl Layer {
     }
 }
 
+/// A video that segments play from; source 0 is the video the editor opened.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Source {
+    pub uri: String,
+    pub name: String,
+    pub duration: i64,
+    /// Displayed size after rotation metadata.
+    pub width: u32,
+    pub height: u32,
+    pub has_audio: bool,
+    /// Size and audio come from probing the file.
+    pub probed: bool,
+    pub size: u64,
+    pub modified: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Segment {
     pub id: u64,
+    /// Index into `Project::sources`.
+    pub source: usize,
     pub source_in: i64,
     pub source_out: i64,
     pub fade_in: i64,
@@ -427,13 +462,12 @@ pub struct Project {
     pub version: u32,
     pub source: String,
     pub name: String,
-    pub duration: i64,
-    /// Displayed source size after rotation metadata.
+    /// Canvas size: the opened video's displayed size.
     pub width: u32,
     pub height: u32,
     pub fps: f64,
-    pub has_audio: bool,
-    /// Timeline order; source ranges increase and never overlap.
+    pub sources: Vec<Source>,
+    /// Timeline order; adjacent ranges of one source never overlap.
     pub segments: Vec<Segment>,
     /// Bottom to top.
     pub layers: Vec<Layer>,
@@ -448,11 +482,10 @@ impl Default for Project {
             version: 1,
             source: String::new(),
             name: String::new(),
-            duration: 0,
             width: 1920,
             height: 1080,
             fps: 30.0,
-            has_audio: true,
+            sources: vec![],
             segments: vec![],
             layers: vec![],
             crop: Crop::default(),
@@ -476,18 +509,86 @@ impl Project {
         let mut project = Self {
             source: source.into(),
             name: name.into(),
-            duration: duration.max(MIN_CLIP),
             width: width.max(2),
             height: height.max(2),
             ..Self::default()
         };
+        project.sources.push(Source {
+            uri: source.into(),
+            name: name.into(),
+            duration: duration.max(MIN_CLIP),
+            width: project.width,
+            height: project.height,
+            has_audio: true,
+            probed: true,
+            ..Source::default()
+        });
         let id = project.id();
         project.segments.push(Segment {
             id,
-            source_out: project.duration,
+            source_out: duration.max(MIN_CLIP),
             ..Segment::default()
         });
         project
+    }
+
+    /// Makes `primary` source 0 and drops segments whose source is missing.
+    pub fn set_primary(&mut self, primary: Source) {
+        if self.sources.is_empty() {
+            self.sources.push(primary);
+        } else {
+            self.sources[0] = primary;
+        }
+        let count = self.sources.len();
+        self.segments.retain(|s| s.source < count);
+    }
+
+    /// Whether any segment plays a source with audio.
+    pub fn has_audio(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| self.sources.get(s.source).is_some_and(|v| v.has_audio))
+    }
+
+    /// Indexes of the sources segments use, in order of first use.
+    pub fn used_sources(&self) -> Vec<usize> {
+        let mut used: Vec<usize> = vec![];
+        for segment in &self.segments {
+            if !used.contains(&segment.source) {
+                used.push(segment.source);
+            }
+        }
+        used
+    }
+
+    /// Inserts all of `video` at the segment boundary nearest `t` and ripples overlays; returns its segment index.
+    pub fn insert_video(&mut self, video: Source, t: i64) -> usize {
+        let index = match self.locate(t) {
+            Some((i, offset)) if offset * 2 >= self.segments[i].length() => i + 1,
+            Some((i, _)) => i,
+            None => 0,
+        };
+        let at = self.starts().get(index).copied().unwrap_or_else(|| self.length());
+        let source = match self.sources.iter().position(|s| s.uri == video.uri) {
+            Some(n) => n,
+            None => {
+                self.sources.push(video);
+                self.sources.len() - 1
+            }
+        };
+        let length = self.sources[source].duration.max(MIN_CLIP);
+        let id = self.id();
+        self.segments.insert(
+            index,
+            Segment {
+                id,
+                source,
+                source_out: length,
+                ..Segment::default()
+            },
+        );
+        self.ripple(at, length);
+        index
     }
 
     pub fn id(&mut self) -> u64 {
@@ -524,30 +625,48 @@ impl Project {
         None
     }
 
-    pub fn source_time(&self, t: i64) -> i64 {
+    /// Segment index and source time shown at timeline time `t`.
+    pub fn source_at(&self, t: i64) -> (usize, i64) {
         self.locate(t)
-            .map(|(i, offset)| self.segments[i].source_in + offset)
-            .unwrap_or(0)
+            .map(|(i, offset)| (i, self.segments[i].source_in + offset))
+            .unwrap_or((0, 0))
     }
 
-    /// Timeline time showing source time `source`; a gap maps to the following segment.
-    pub fn timeline_time(&self, source: i64) -> i64 {
-        let mut at = 0;
-        for segment in &self.segments {
-            if source < segment.source_out {
-                return at + (source - segment.source_in).clamp(0, segment.length());
-            }
-            at += segment.length();
-        }
-        at
+    /// Timeline time showing source time `source` of segment `index`.
+    pub fn timeline_at(&self, index: usize, source: i64) -> i64 {
+        let Some(segment) = self.segments.get(index) else {
+            return self.length();
+        };
+        self.starts()[index] + (source - segment.source_in).clamp(0, segment.length())
     }
 
-    /// Source ranges to play in order.
-    pub fn ranges(&self) -> Vec<[i64; 2]> {
+    /// Source ranges to play in order, as `[in, out, source]`.
+    pub fn ranges(&self) -> Vec<[i64; 3]> {
         self.segments
             .iter()
-            .map(|s| [s.source_in, s.source_out])
+            .map(|s| [s.source_in, s.source_out, s.source as i64])
             .collect()
+    }
+
+    /// Source time limits for segment `index`'s edges: its source's ends, or an adjacent piece of the same source.
+    pub fn trim_bounds(&self, index: usize) -> (i64, i64) {
+        let Some(segment) = self.segments.get(index) else {
+            return (0, 0);
+        };
+        let floor = index
+            .checked_sub(1)
+            .map(|i| &self.segments[i])
+            .filter(|p| p.source == segment.source && p.source_out <= segment.source_in)
+            .map_or(0, |p| p.source_out);
+        let ceiling = self
+            .segments
+            .get(index + 1)
+            .filter(|n| n.source == segment.source && n.source_in >= segment.source_out)
+            .map_or_else(
+                || self.sources.get(segment.source).map_or(segment.source_out, |s| s.duration),
+                |n| n.source_in,
+            );
+        (floor, ceiling.max(segment.source_out))
     }
 
     pub fn split(&mut self, t: i64) -> bool {
@@ -591,17 +710,11 @@ impl Project {
             return 0;
         };
         let start = self.starts()[index];
+        let (floor, ceiling) = self.trim_bounds(index);
         let applied = if head {
-            let floor = index
-                .checked_sub(1)
-                .map_or(0, |i| self.segments[i].source_out);
             (segment.source_in + delta).clamp(floor, segment.source_out - MIN_CLIP)
                 - segment.source_in
         } else {
-            let ceiling = self
-                .segments
-                .get(index + 1)
-                .map_or(self.duration, |s| s.source_in);
             (segment.source_out + delta).clamp(segment.source_in + MIN_CLIP, ceiling)
                 - segment.source_out
         };
@@ -728,6 +841,8 @@ impl Project {
             visible: true,
             locked: false,
             color,
+            captions: false,
+            linked: false,
             clips: vec![],
         });
         self.layers.len() - 1
@@ -825,6 +940,81 @@ impl Project {
         let new_id = copy.id;
         self.insert_sorted(layer, copy);
         Some(new_id)
+    }
+
+    /// Topmost layer made from a transcript.
+    pub fn caption_layer(&self) -> Option<usize> {
+        self.layers.iter().rposition(|l| l.captions)
+    }
+
+    /// Replaces the caption layer's clips, adding a linked "Captions" layer on top when there is none; returns its index.
+    pub fn set_captions(&mut self, mut clips: Vec<Clip>) -> usize {
+        let layer = self.caption_layer().unwrap_or_else(|| {
+            let l = self.add_layer(LayerKind::Text);
+            let layer = &mut self.layers[l];
+            (layer.name, layer.captions, layer.linked) = ("Captions".into(), true, true);
+            l
+        });
+        for clip in &mut clips {
+            clip.id = self.id();
+        }
+        self.layers[layer].clips = clips;
+        layer
+    }
+
+    /// Spreads an edit of text clip `before.id` through a linked layer: placement, animation and style to every clip, words to its phrase.
+    pub fn follow(&mut self, before: &Clip) -> bool {
+        let Some((l, c)) = self.locate_clip(before.id) else {
+            return false;
+        };
+        let after = self.layers[l].clips[c].clone();
+        let (Some(old), Some(new)) = (before.text(), after.text()) else {
+            return false;
+        };
+        if !self.layers[l].linked || after == *before {
+            return false;
+        }
+        let look = |clip: &Clip, style: &TextStyle| Clip {
+            id: 0,
+            start: 0,
+            end: 0,
+            phrase: 0,
+            body: Body::Text(TextStyle {
+                text: String::new(),
+                highlight: None,
+                ..style.clone()
+            }),
+            ..clip.clone()
+        };
+        let restyled = look(before, old) != look(&after, new);
+        let reworded = old.text != new.text;
+        if reworded && let Some(style) = self.layers[l].clips[c].text_mut() {
+            style.highlight = old.highlight.and_then(|r| crate::speech::rehighlight(&old.text, &new.text, r));
+        }
+        for clip in self.layers[l].clips.iter_mut().filter(|x| x.id != after.id) {
+            let Some(style) = clip.text().cloned() else {
+                continue;
+            };
+            let (text, highlight) = if reworded && after.phrase != 0 && clip.phrase == after.phrase {
+                let moved = style.highlight.and_then(|r| crate::speech::rehighlight(&style.text, &new.text, r));
+                (new.text.clone(), moved)
+            } else {
+                (style.text, style.highlight)
+            };
+            if restyled {
+                *clip = Clip {
+                    id: clip.id,
+                    start: clip.start,
+                    end: clip.end,
+                    phrase: clip.phrase,
+                    ..after.clone()
+                };
+            }
+            if let Some(style) = clip.text_mut() {
+                (style.text, style.highlight) = (text, highlight);
+            }
+        }
+        restyled || reworded
     }
 
     pub fn remove_clip(&mut self, id: u64) -> Option<Clip> {
@@ -995,12 +1185,12 @@ mod tests {
         assert!(p.split(4000));
         assert!(p.split(7000));
         assert!(!p.split(7050), "Too close to an existing cut");
-        assert_eq!(p.ranges(), [[0, 4000], [4000, 7000], [7000, 10_000]]);
+        assert_eq!(p.ranges(), [[0, 4000, 0], [4000, 7000, 0], [7000, 10_000, 0]]);
         let id = p.add_clip(text(8000, 9000));
         let inside = p.add_clip(text(4500, 5000));
         let straddle = p.add_clip(text(3000, 6000));
         assert!(p.remove_segment(1));
-        assert_eq!(p.ranges(), [[0, 4000], [7000, 10_000]]);
+        assert_eq!(p.ranges(), [[0, 4000, 0], [7000, 10_000, 0]]);
         assert_eq!(p.length(), 7000);
         assert_eq!((p.clip(id).unwrap().start, p.clip(id).unwrap().end), (5000, 6000));
         assert!(p.clip(inside).is_none());
@@ -1008,11 +1198,11 @@ mod tests {
             (p.clip(straddle).unwrap().start, p.clip(straddle).unwrap().end),
             (3000, 4000)
         );
-        assert_eq!(p.source_time(3999), 3999);
-        assert_eq!(p.source_time(4000), 7000);
-        assert_eq!(p.timeline_time(7500), 4500);
-        assert_eq!(p.timeline_time(5000), 4000, "A removed range maps to the next segment");
-        assert_eq!(p.timeline_time(20_000), 7000);
+        assert_eq!(p.source_at(3999), (0, 3999));
+        assert_eq!(p.source_at(4000), (1, 7000));
+        assert_eq!(p.timeline_at(1, 7500), 4500);
+        assert_eq!(p.timeline_at(1, 5000), 4000, "Before a segment clamps to its start");
+        assert_eq!(p.timeline_at(1, 20_000), 7000);
         assert!(p.remove_segment(0));
         assert!(!p.remove_segment(0), "The last segment stays");
     }
@@ -1024,14 +1214,66 @@ mod tests {
         let after = p.add_clip(text(6000, 7000));
         assert_eq!(p.trim_segment(0, false, 2000), 0, "Next segment owns that source");
         assert_eq!(p.trim_segment(0, false, -1000), -1000);
-        assert_eq!(p.ranges(), [[0, 4000], [5000, 10_000]]);
+        assert_eq!(p.ranges(), [[0, 4000, 0], [5000, 10_000, 0]]);
         assert_eq!(p.clip(after).unwrap().start, 5000);
         assert_eq!(p.trim_segment(1, true, -600), -600);
-        assert_eq!(p.ranges(), [[0, 4000], [4400, 10_000]]);
+        assert_eq!(p.ranges(), [[0, 4000, 0], [4400, 10_000, 0]]);
         assert_eq!(p.clip(after).unwrap().start, 5600);
         assert_eq!(p.trim_segment(1, true, 99_999), 5500);
         assert_eq!(p.segments[1].length(), MIN_CLIP);
         assert_eq!(p.trim_segment(0, true, -50), 0);
+    }
+
+    fn video(uri: &str, duration: i64) -> Source {
+        Source {
+            uri: uri.into(),
+            duration,
+            width: 1080,
+            height: 1920,
+            has_audio: false,
+            ..Source::default()
+        }
+    }
+
+    #[test]
+    fn inserted_videos_go_to_the_nearest_boundary_and_ripple_overlays() {
+        let mut p = project();
+        p.split(4000);
+        let caption = p.add_clip(text(5000, 6000));
+        assert!(p.has_audio(), "The opened video has audio");
+        assert_eq!(p.insert_video(video("content://b", 3000), 1000), 0, "Near the start of the first segment");
+        assert_eq!(p.ranges(), [[0, 3000, 1], [0, 4000, 0], [4000, 10_000, 0]]);
+        assert_eq!(p.clip(caption).unwrap().start, 8000);
+        assert_eq!(p.insert_video(video("content://b", 3000), 12_500), 3, "Appends after the last segment, reusing the source");
+        assert_eq!(p.sources.len(), 2);
+        assert_eq!(p.used_sources(), [1, 0]);
+        assert_eq!(p.length(), 16_000);
+        assert_eq!(p.source_at(3000), (1, 0));
+        assert_eq!(p.source_at(10_500), (2, 7500));
+        assert_eq!(p.source_at(13_500), (3, 500));
+        assert_eq!(p.timeline_at(3, 500), 13_500);
+        assert_eq!(p.trim_bounds(0), (0, 3000), "A whole inserted video cannot grow");
+        assert_eq!(p.trim_bounds(2), (4000, 10_000), "Neighbours of one source still bound each other");
+        assert_eq!(p.trim_segment(3, false, -1000), -1000);
+        assert_eq!(p.trim_segment(3, false, 5000), 1000, "Grows back to the source end only");
+        p.remove_segment(1);
+        p.remove_segment(1);
+        assert_eq!(p.used_sources(), [1]);
+        assert!(!p.has_audio());
+    }
+
+    #[test]
+    fn primary_source_is_replaced_and_orphan_segments_dropped() {
+        let mut p = project();
+        p.insert_video(video("content://b", 3000), 99_000);
+        p.sources.truncate(1);
+        p.set_primary(video("content://v", 10_000));
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.sources[0].height, 1920);
+        let legacy: Project = serde_json::from_str(r#"{"source":"content://v","segments":[{"id":1,"source_in":0,"source_out":5000}]}"#).unwrap();
+        let mut legacy = legacy;
+        legacy.set_primary(video("content://v", 10_000));
+        assert_eq!(legacy.ranges(), [[0, 5000, 0]]);
     }
 
     #[test]
@@ -1175,5 +1417,67 @@ mod tests {
         style.apply_preset(&presets()[2].1);
         assert_eq!((style.text.as_str(), style.size), ("Keep", 0.1));
         assert_eq!(style.background[3], 52);
+    }
+
+    fn line(start: i64, end: i64, words: &str, phrase: u64, highlight: Option<[usize; 2]>) -> Clip {
+        Clip {
+            start,
+            end,
+            phrase,
+            body: Body::Text(TextStyle {
+                text: words.into(),
+                highlight,
+                ..TextStyle::default()
+            }),
+            ..Clip::default()
+        }
+    }
+
+    #[test]
+    fn captions_fill_one_linked_layer_and_regenerate_in_place() {
+        let mut p = project();
+        p.add_clip(text(0, 1000));
+        let layer = p.set_captions(vec![line(0, 500, "Hello there", 1, Some([0, 5])), line(500, 900, "Hello there", 1, Some([6, 11]))]);
+        assert_eq!(layer, 1);
+        assert!(p.layers[1].captions && p.layers[1].linked && p.layers[1].name == "Captions");
+        assert_eq!(p.layers[1].clips.len(), 2);
+        assert_ne!(p.layers[1].clips[0].id, p.layers[1].clips[1].id);
+        assert_eq!(p.set_captions(vec![line(0, 900, "Hello there", 1, None)]), 1);
+        assert_eq!((p.layers.len(), p.layers[1].clips.len()), (2, 1));
+    }
+
+    #[test]
+    fn linked_edits_move_and_restyle_every_caption_and_reword_the_phrase() {
+        let mut p = project();
+        p.set_captions(vec![
+            line(0, 400, "big red dog", 1, Some([0, 3])),
+            line(400, 800, "big red dog", 1, Some([4, 7])),
+            line(800, 1500, "runs", 2, None),
+        ]);
+        let ids: Vec<u64> = p.layers[0].clips.iter().map(|c| c.id).collect();
+        let before = p.clip(ids[1]).unwrap().clone();
+        let clip = p.clip_mut(ids[1]).unwrap();
+        (clip.x, clip.y) = (0.3, 0.2);
+        clip.text_mut().unwrap().color = [255, 0, 0, 255];
+        assert!(p.follow(&before));
+        for clip in &p.layers[0].clips {
+            assert_eq!((clip.x, clip.y, clip.text().unwrap().color), (0.3, 0.2, [255, 0, 0, 255]));
+        }
+        assert_eq!(p.layers[0].clips[2].text().unwrap().text, "runs", "Words stay per clip");
+        assert_eq!((p.layers[0].clips[2].start, p.layers[0].clips[2].phrase), (800, 2));
+        let before = p.clip(ids[0]).unwrap().clone();
+        p.clip_mut(ids[0]).unwrap().text_mut().unwrap().text = "large red dog".into();
+        assert!(p.follow(&before));
+        let words: Vec<(&str, Option<[usize; 2]>)> = p.layers[0]
+            .clips
+            .iter()
+            .map(|c| (c.text().unwrap().text.as_str(), c.text().unwrap().highlight))
+            .collect();
+        assert_eq!(words, [("large red dog", Some([0, 5])), ("large red dog", Some([6, 9])), ("runs", None)]);
+        p.layers[0].linked = false;
+        let before = p.clip(ids[2]).unwrap().clone();
+        p.clip_mut(ids[2]).unwrap().y = 0.9;
+        assert!(!p.follow(&before));
+        assert_eq!(p.layers[0].clips[0].y, 0.2);
     }
 }

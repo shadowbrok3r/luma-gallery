@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.14 — 2026-10-13
+
+Video editor: add more videos to the timeline from the Video tool (at the cut nearest the
+playhead) or the + tile after the last clip (at the end). Each clip keeps its own audio; other
+sizes and rotations are letterboxed into the canvas in the preview and the export.
+Playback: scrubbing, Play and Loop work again after a video reaches its end; looping no longer
+reports "This recording could not play".
+Captions from speech: the Captions tool transcribes the timeline's audio on the phone with
+whisper.cpp (a 57 MB model downloads on first use) and adds a linked caption layer shown as
+phrases, one word at a time, or phrases with the spoken word highlighted. Captions use the text
+styles; moving or restyling one moves or restyles them all. Exports draw each overlay layer as one
+FFmpeg input, with animations baked per frame, so hundreds of captions export quickly.
+FFmpeg now includes the concat demuxer and WAV muxer. Media tools start with fork/exec; the
+previous posix_spawn could hang a tool for its whole timeout when two started at once.
+
 ## v0.1.13 — 2026-10-12
 
 Video editor: split, delete with ripple and segment fades; caption and photo overlay layers with

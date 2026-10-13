@@ -34,6 +34,16 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
 - **Edit video** (pencil in the viewer, or the More menu) opens a multi-layer editor. The video
   track splits at the playhead; deleting a part ripples later captions with it. Segments fade in
   and out through black or white, and a cut can dip to black. Playback skips removed parts.
+- **Video** (or the + tile after the last clip) adds another library video to the track, at the
+  cut nearest the playhead or at the end. Other sizes and rotations are letterboxed into the
+  first video's frame; each clip keeps its own audio, and silent clips play silence.
+- **Captions** transcribes the timeline's audio on the phone with whisper.cpp (base model; 57 MB
+  downloaded once from Hugging Face and checked by SHA-256; audio never leaves the device) and
+  fills a "Captions" layer: phrases of up to N words, one word at a time, or phrases with the
+  spoken word in a highlight color. Pick the language or let whisper detect it. Position, size,
+  look and highlight color apply to every caption; dragging or restyling one caption moves or
+  restyles the whole linked layer, and tapping one edits its words. "Update captions" rebuilds
+  the layer in another mode without transcribing again. Debug adds a sample transcript.
 - Captions sit on text layers and photos on overlay layers, drawn as translucent clip boxes
   in each layer's color; colored bands on the video track show where layers overlap it. Drag a
   caption on the video (it snaps to the center lines), resize/rotate with its corner handle or
@@ -44,8 +54,9 @@ Android 10+ gallery built with EguiMobile 0.1.4. Package: `app.luma.gallery`.
   or glow, spacing and wrap width, plus presets (Classic, Subtitle, Glass, Yellow, Neon, ...).
   Captions and overlays fade or slide in and out. Canvas crop, audio volume/fades, undo/redo and
   per-video autosave are included; Debug shows mapping, render timing, JSON and the FFmpeg command.
-- Exports render every caption with the same rasterizer as the preview, then FFmpeg composes
-  cuts, fades, crop and overlays into a new H.264/AAC file under `Movies/Luma`.
+- Exports render every caption with the same rasterizer as the preview into one frame track per
+  layer (animations are drawn per output frame), then FFmpeg composes cuts, fades, crop and the
+  tracks into a new H.264/AAC file under `Movies/Luma`.
 - The camera button beside video crop saves the selected frame as a full-resolution PNG
   under `Pictures/Luma`. It pauses playback and uses the original video, including rotation,
   without the app controls or pending clip crop. Scrub previews follow the current video;
@@ -108,6 +119,14 @@ Checks that moving/resizing survives release and that photo/video copies use the
 Video editor regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-studio.py --serial emulator-5554`.
 Adds a caption, splits twice, deletes the middle part and exports; checks duration, audio, the
 burned-in caption (OCR) and the cut against the source.
+Multi-video regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-multivideo.py --serial emulator-5554`.
+Adds a rotated portrait clip before and a silent clip after a video, plays across the cut,
+reopens the project and checks the export's order, letterboxing and per-clip audio.
+Playback regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-playback.py --serial emulator-5554`.
+Scrubs and plays after the end, restarts from the end, scrubs while playing and loops.
+Caption regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-captions.py --serial emulator-5554`.
+Transcribes the JFK sample in the editor (downloading the model on first run), adds one-word
+captions, drags them to the top and checks by OCR that the export shows each word on time.
 Video frame regression: `TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-video-frames.py --serial emulator-5554 --evidence evidence/video-frames`.
 Checks moving previews across warm video switches, silent WebM, full-resolution PNG frames,
 rotation, Android metadata fallback and unchanged originals against generated video fixtures.
@@ -140,9 +159,11 @@ HDR-to-SDR tone mapping are not implemented. Frame stepping uses the reported av
 variable-frame-rate footage is not guaranteed frame-index exact. Fast-cut boundaries can
 include extra codec reorder frames; use Exact cut for tighter boundaries.
 
-The video editor edits one source video per project; it does not join other videos or place
-video picture-in-picture. Its preview applies cuts, fades and overlays live, but volume and audio
-fades are heard only in the export. Color emoji render from bitmap (CBDT/sbix) emoji fonts;
+The video editor joins videos on one track; it does not place video picture-in-picture. The
+preview switches files at a cut between videos with a short pause, and volume and audio fades
+are heard only in the export. Speech recognition uses whisper's base model: word times come
+from its token timestamps and are usually within a tenth of a second; there is no speaker
+separation, and editing the timeline after transcribing needs a new transcription. Color emoji render from bitmap (CBDT/sbix) emoji fonts;
 COLRv1-only emoji fonts, such as the Android 16 emulator's, fall back to monochrome Noto Emoji.
 Editor exports re-encode with x264 and use the cropped source size or a 1080p/720p limit.
 

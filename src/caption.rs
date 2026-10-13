@@ -430,6 +430,8 @@ struct Cluster {
     glyphs: Vec<Glyph>,
     advance: f32,
     space: bool,
+    /// Index of the cluster's first character in the whole text.
+    index: usize,
 }
 
 #[derive(Debug, Default)]
@@ -443,8 +445,8 @@ fn sticky(c: char) -> bool {
         || matches!(c, '\u{0300}'..='\u{036F}' | '\u{E0020}'..='\u{E007F}')
 }
 
-/// Shapes one paragraph into clusters in logical order; returns whether it reads right to left.
-fn shape(text: &str, faces: &mut Faces, px: f32, spacing: f32) -> (Vec<Cluster>, bool) {
+/// Shapes one paragraph starting at character `base` into clusters in logical order; returns whether it reads right to left.
+fn shape(text: &str, base: usize, faces: &mut Faces, px: f32, spacing: f32) -> (Vec<Cluster>, bool) {
     let mut runs: Vec<(usize, usize, usize)> = vec![];
     for (at, c) in text.char_indices() {
         let face = match runs.last() {
@@ -496,6 +498,7 @@ fn shape(text: &str, faces: &mut Faces, px: f32, spacing: f32) -> (Vec<Cluster>,
                         glyphs: vec![],
                         advance: 0.0,
                         space,
+                        index: base + text[..at].chars().count(),
                     },
                 ));
             }
@@ -743,8 +746,10 @@ pub fn render_text_with(
     let spacing = style.spacing * px;
     let mut lines = vec![];
     let mut rtl = false;
+    let mut base = 0;
     for paragraph in text.split('\n') {
-        let (clusters, backward) = shape(paragraph, &mut faces, px, spacing);
+        let (clusters, backward) = shape(paragraph, base, &mut faces, px, spacing);
+        base += paragraph.chars().count() + 1;
         rtl |= backward;
         lines.extend(wrap(clusters, max));
     }
@@ -794,6 +799,7 @@ pub fn render_text_with(
         (height as f32 - box_height) / 2.0,
     );
     let mut glyphs = PathBuilder::new();
+    let mut marked = PathBuilder::new();
     let mut underlines = PathBuilder::new();
     let mut images: Vec<(Pixmap, Transform)> = vec![];
     let skew = if fake_italic { 0.2 } else { 0.0 };
@@ -816,6 +822,7 @@ pub fn render_text_with(
             Box::new(line.clusters.iter())
         };
         for cluster in order {
+            let lit = style.highlight.is_some_and(|[a, b]| (a..b).contains(&cluster.index));
             for glyph in cluster.glyphs.iter().filter(|g| g.id != 0) {
                 let loaded = &faces.loaded[glyph.face];
                 let Some(font) = loaded.font() else { continue };
@@ -842,7 +849,7 @@ pub fn render_text_with(
                     continue;
                 };
                 let mut path = Pen {
-                    path: &mut glyphs,
+                    path: if lit { &mut marked } else { &mut glyphs },
                     x: pen + glyph.x,
                     y: baseline - glyph.y,
                     skew,
@@ -863,6 +870,7 @@ pub fn render_text_with(
         }
     }
     let glyphs = glyphs.finish();
+    let marked = marked.finish();
     let underlines = underlines.finish();
     let backdrop = rounded_rect(
         origin.0,
@@ -882,7 +890,7 @@ pub fn render_text_with(
                     layer.fill_path(path, &color, FillRule::Winding, at, None);
                 }
             } else {
-                for path in [&glyphs, &underlines].into_iter().flatten() {
+                for path in [&glyphs, &marked, &underlines].into_iter().flatten() {
                     layer.fill_path(path, &color, FillRule::Winding, at, None);
                     if outline > 0.0 {
                         let stroke = Stroke {
@@ -902,7 +910,7 @@ pub fn render_text_with(
     if has_box && let Some(path) = &backdrop {
         pixmap.fill_path(path, &paint(style.background), FillRule::Winding, identity, None);
     }
-    for path in [&glyphs, &underlines].into_iter().flatten() {
+    for path in [&glyphs, &marked, &underlines].into_iter().flatten() {
         if outline > 0.0 && style.outline_color[3] > 0 {
             let stroke = Stroke {
                 width: outline * 2.0,
@@ -913,8 +921,9 @@ pub fn render_text_with(
             pixmap.stroke_path(path, &paint(style.outline_color), &stroke, identity, None);
         }
     }
-    for path in [&glyphs, &underlines].into_iter().flatten() {
-        let fill = paint(style.color);
+    for (path, color) in [(&glyphs, style.color), (&marked, style.highlight_color), (&underlines, style.color)] {
+        let Some(path) = path else { continue };
+        let fill = paint(color);
         pixmap.fill_path(path, &fill, FillRule::Winding, identity, None);
         if fake_bold {
             let stroke = Stroke {
@@ -1054,6 +1063,48 @@ mod tests {
         assert!(wrapped.content[3] > line * 1.8, "Wrapped onto several lines");
         assert!((manual.content[3] - (2.0 * line - 36.0)).abs() < 1.0);
         assert!(render_text_with(&book, &style("  \n "), 1000.0, 1000.0).image.width() == 2);
+    }
+
+    #[test]
+    fn highlighted_word_takes_the_highlight_color_on_any_line() {
+        let book = FontBook::embedded();
+        let yellow = |image: &RgbaImage| -> Vec<u32> {
+            image
+                .enumerate_pixels()
+                .filter(|(_, _, p)| p[3] > 200 && p[0] > 200 && p[1] > 180 && p[2] < 60)
+                .map(|(x, _, _)| x)
+                .collect()
+        };
+        let plain = render_text_with(&book, &style("one two\nthree"), 1000.0, 1000.0);
+        assert!(yellow(&plain.image).is_empty());
+        let second = render_text_with(
+            &book,
+            &TextStyle {
+                highlight: Some([4, 7]),
+                ..style("one two\nthree")
+            },
+            1000.0,
+            1000.0,
+        );
+        let xs = yellow(&second.image);
+        let middle = second.image.width() / 2;
+        assert!(xs.len() > 200 && xs.iter().all(|&x| x > middle - 10), "Only the right-hand word is yellow");
+        let third = render_text_with(
+            &book,
+            &TextStyle {
+                highlight: Some([8, 13]),
+                ..style("one two\nthree")
+            },
+            1000.0,
+            1000.0,
+        );
+        let rows: Vec<u32> = third
+            .image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] > 200 && p[0] > 200 && p[1] > 180 && p[2] < 60)
+            .map(|(_, y, _)| y)
+            .collect();
+        assert!(!rows.is_empty() && rows.iter().all(|&y| y > third.image.height() / 2), "Second line lit");
     }
 
     #[test]

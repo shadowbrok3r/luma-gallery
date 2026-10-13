@@ -1,5 +1,91 @@
 # Verification
 
+## Speech Captions Release 0.1.14 (2026-10-13)
+
+Recognition: whisper.cpp 1.9.5 is built with NDK 28 as `libwhisper_exec.so` (2.1 MB on arm64
+with `armv8.2-a+dotprod+fp16`; SSE4.2/AVX/F16C on x86_64, matching the emulator's CPUID). The
+base multilingual model (`ggml-base-q5_1.bin`, 59,707,625 bytes) downloads once from a pinned
+Hugging Face revision into app files and must match its SHA-256. FFmpeg, now built with the WAV
+muxer, renders the timeline's audio (cuts applied, silence for silent clips) as 16 kHz mono;
+whisper-cli writes `-ojf` token offsets, which Rust joins into words, rejoining UTF-8 characters
+split across tokens.
+
+- Word timing: on `samples/jfk.wav`, token offsets matched speech onsets measured from the audio
+  envelope within 10 ms ("ask" 3290 vs 3280 ms, "not" 4010 vs 4020, second "ask" 8190 vs 8180).
+  DTW timestamps (`-dtw base`) were less accurate and are not used.
+- Export scale: 450 one-word overlays as separate FFmpeg inputs took 21,705 threads and 5.5 GB on
+  the desktop; drawn as one ffconcat track they took 155 threads and 2.8 s. Every visible layer
+  is now one track of frames the size of everything it shows; fades and slides are drawn for each
+  output frame with `Clip::envelope`, the function the preview uses.
+- Process start: bionic's `posix_spawn` resets every caught signal in the child, and ART's
+  libsigchain logged a stack for each reset inside a child sharing the app's memory. Two tools
+  started together hung until the 30 s watchdog killed them (exit 137) in 1 of 7 emulator app
+  starts, losing a rotated clip's probe. Tools now start with `fork` and `execve`; libsigchain
+  logged nothing and no tool failed during the four editor smoke runs that followed.
+- 76 host tests pass, including word joining, phrase grouping, highlight ranges, highlighted
+  rendering, linked caption edits, ffconcat lists, the speech audio graph, baked fade frames, a
+  transcript-to-caption-drag editor test, and a desktop FFmpeg render of a two-caption track.
+  `desktop_whisper_transcribes_the_jfk_sample_with_word_times` passes with `WHISPER_CLI` and
+  `WHISPER_MODEL` set to a host build.
+- Manual run on the s26ultra AVD: the model downloaded and the 11 s JFK clip gave 22 words with
+  the exact text; highlighted captions exported with "fellow", "ask", "not", "country" and "can"
+  lit at 1.0, 3.5, 4.2, 5.8 and 9.0 s.
+- `scripts/smoke-captions.py` passed 5 checks: 22 words, one word on the stage at the playhead,
+  a drag moving every caption, an export showing the expected word at 0.95, 3.55, 4.5 and 6.0 s
+  and none at 2.8 s at the new position, and the unchanged original.
+- `smoke-multivideo.py` (8 checks), `smoke-playback.py` (6), `smoke-studio.py` (7) and
+  `smoke-export.py` pass on this build. `smoke-video-frames.py`, `smoke-dng.py` and
+  `smoke-editing.py` fail at the same steps on the previous build, so those failures predate
+  this change.
+
+Evidence: `evidence/captions-smoke/`.
+
+```sh
+cargo test --lib
+WHISPER_CLI=.build/whisper-host/bin/whisper-cli WHISPER_MODEL=.build/models/ggml-base-q5_1.bin cargo test --lib -- --ignored desktop_whisper
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-captions.py --serial emulator-5554
+```
+
+## Multi-video Editor and Playback Fixes Release 0.1.14 (2026-10-12)
+
+Playback: LibVLC 3 ignores `play()` and seeks once its input has ended, and `stop()+play()`
+reopens a dup of the media descriptor still at its EOF offset (`libvlc demux: cannot peek`, then
+"This recording could not play"). Media now opens with `:play-and-pause`, so the input pauses
+at its end and stays alive; pauses the app did not request mark the clip finished, wrap the
+loop or advance the edit. An ended input is reopened from a rewound descriptor, and pausing an
+input that is still opening waits for its Playing event instead of stopping it.
+
+Multiple videos: a project lists its source videos and each segment names one. The Java watcher
+follows segments by index and swaps the player's media at a cut between videos. Exports open
+one descriptor per video; the first is FFmpeg's stdin and the others are passed to the child at
+fixed numbers with `-fd N -i fd:`. When any segment is not the opened video, every segment is
+scaled and padded to the canvas, `setsar=1`, set to the canvas frame rate, and its audio
+resampled to 48 kHz stereo, with `anullsrc` for silent clips. Added videos are probed for
+rotation and audio before export is enabled.
+
+- 64 host tests pass, including multi-video insert/trim/ripple, legacy project loading, the
+  multi-input graph, and `desktop_ffmpeg_joins_videos_of_other_sizes_and_silent_ones`, which
+  renders a 640x360 video around a silent 180x320 clip with host FFmpeg 9.0.1 and checks the
+  letterboxing, order and duration by pixel.
+- `scripts/smoke-playback.py` passed 6 checks on the s26ultra AVD: stop at the end, scrub after
+  the end then play, Play at the end restarts, scrub while playing resumes, scrub to the end
+  while playing, and a loop that wraps with no error. Before the fix, the first two and the loop
+  failed on this AVD.
+- `scripts/smoke-multivideo.py` passed 8 checks: a 90-degree-rotated portrait clip inserted
+  before the video and letterboxed upright in the preview, a silent clip appended, playback
+  across the cut (1.587 to 4.400 s), the project restored after reopening, and a 13.00 s
+  960x540 export with the pictures in order, 880 Hz / 440 Hz / silent audio sections and
+  unchanged originals.
+- `scripts/smoke-studio.py` still passes all 7 checks.
+
+Evidence: `evidence/playback-smoke/` and `evidence/multivideo-smoke/`.
+
+```sh
+cargo test --lib
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-playback.py --serial emulator-5554
+TESSDATA_PREFIX=.build/tessdata python3 scripts/smoke-multivideo.py --serial emulator-5554
+```
+
 ## Video Editor Release 0.1.13 (2026-10-12)
 
 The editor keeps one project per source video (URI and size; "Open with" files get a new
