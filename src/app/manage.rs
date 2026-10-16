@@ -542,7 +542,7 @@ impl Gallery {
                         );
                         response.widget_info(|| {
                             egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
+                                egui::Role::Button,
                                 problem.is_none(),
                                 album,
                             )

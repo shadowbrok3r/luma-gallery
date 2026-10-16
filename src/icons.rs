@@ -153,7 +153,7 @@ pub fn button(ui: &mut Ui, name: &str, label: &str, active: bool) -> Response {
         );
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label)
     });
     note(ui, label, response.rect);
     response

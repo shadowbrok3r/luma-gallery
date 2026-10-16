@@ -1033,7 +1033,7 @@ fn tool_strip(ui: &mut egui::Ui, tools: &[(&str, &str, bool)]) -> Option<usize> 
                         color,
                     );
                     response.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+                        egui::WidgetInfo::labeled(egui::Role::Button, enabled, label)
                     });
                     if enabled {
                         icons::note(ui, label, rect);
@@ -1302,14 +1302,14 @@ impl Gallery {
         let width = bar.width() / groups.len() as f32;
         for (n, (group, label)) in groups.into_iter().enumerate() {
             let rect = Rect::from_min_size(bar.min + vec2(n as f32 * width, 0.0), vec2(width, GROUPS));
-            let response = ui.interact(rect, ui.id().with(("group", label)), Sense::click());
+            let response = ui.interact(rect, ui.scope_id().with(("group", label)), Sense::click());
             let active = s.group == group;
             let color = if active { ACCENT } else if response.is_pointer_button_down_on() { TEXT } else { MUTED };
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), color);
             if active {
                 ui.painter().hline(rect.center().x - 20.0..=rect.center().x + 20.0, rect.top() + 2.0, Stroke::new(2.0, ACCENT));
             }
-            response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, label));
+            response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, label));
             icons::note(ui, label, rect);
             if response.clicked() {
                 s.group = group;
@@ -1630,10 +1630,10 @@ impl Gallery {
         let (area, _) = ui.allocate_exact_size(size, Sense::hover());
         for (n, (icon, label, factor)) in [("zoom_out", "Zoom timeline out", 1.0 / 1.6), ("zoom_in", "Zoom timeline in", 1.6)].into_iter().enumerate() {
             let rect = Rect::from_min_size(area.min + vec2(n as f32 * HEADER / 2.0, 0.0), vec2(HEADER / 2.0, RULER)).shrink(1.5);
-            let response = ui.interact(rect, ui.id().with(label), Sense::click());
+            let response = ui.interact(rect, ui.scope_id().with(label), Sense::click());
             ui.painter().rect_filled(rect, 4, Color32::from_white_alpha(if response.is_pointer_button_down_on() { 45 } else { 16 }));
             icons::image(icon, TEXT, 14.0).paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(14.0)));
-            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
             icons::note(ui, label, rect);
             if response.clicked() {
                 s.scale = (s.scale * factor).clamp(6.0, 900.0);
@@ -1644,7 +1644,7 @@ impl Gallery {
         if s.scale <= 0.0 {
             s.scale = (track.width() * 0.8 / (length as f32 / 1000.0).max(0.5)).clamp(10.0, 160.0);
         }
-        let response = ui.interact(track, ui.id().with("studio_track"), Sense::click_and_drag());
+        let response = ui.interact(track, ui.scope_id().with("studio_track"), Sense::click_and_drag());
         if let Some(touch) = ui.input(|i| i.multi_touch())
             && area.contains(touch.center_pos)
         {
@@ -1890,13 +1890,13 @@ impl Gallery {
                         .paint_at(ui, Rect::from_center_size(lock.center(), Vec2::splat(13.0)));
                     let name = layer.name.clone();
                     let eye_response = ui
-                        .interact(eye.intersect(body), ui.id().with(("eye", layer.id)), Sense::click())
+                        .interact(eye.intersect(body), ui.scope_id().with(("eye", layer.id)), Sense::click())
                         .on_hover_text(format!("Show or hide {name}"));
-                    eye_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Visibility {name}")));
+                    eye_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Visibility {name}")));
                     if eye_response.clicked() {
                         s.project.layers[l].visible = !s.project.layers[l].visible;
                     }
-                    let lock_response = ui.interact(lock.intersect(body), ui.id().with(("lock", s.project.layers[l].id)), Sense::click());
+                    let lock_response = ui.interact(lock.intersect(body), ui.scope_id().with(("lock", s.project.layers[l].id)), Sense::click());
                     if lock_response.clicked() {
                         s.project.layers[l].locked = !s.project.layers[l].locked;
                     }
@@ -1907,8 +1907,8 @@ impl Gallery {
                     let keep = s.project.audio.keep;
                     icons::image(if keep { "volume" } else { "mute" }, if keep { TRIM } else { MUTED }, 16.0)
                         .paint_at(ui, Rect::from_center_size(toggle.center(), Vec2::splat(16.0)));
-                    let response = ui.interact(toggle.intersect(body), ui.id().with("film_audio"), Sense::click());
-                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Video audio"));
+                    let response = ui.interact(toggle.intersect(body), ui.scope_id().with("film_audio"), Sense::click());
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Video audio"));
                     if response.clicked() && s.project.has_audio() {
                         s.project.audio.keep = !keep;
                     }
@@ -2365,7 +2365,7 @@ impl Gallery {
                         Color32::WHITE,
                     );
                     ui.painter().text(rect.center_bottom() - vec2(0.0, 2.0), Align2::CENTER_BOTTOM, name, FontId::proportional(9.0), MUTED);
-                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
                     if response.clicked() {
                         chosen = Some(preset);
                     }
@@ -2424,7 +2424,7 @@ impl Gallery {
                                 Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
                                 Color32::WHITE,
                             );
-                            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &family));
+                            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &family));
                             if response.clicked() {
                                 font = Some(family);
                             }
@@ -2706,7 +2706,7 @@ impl Gallery {
                 if ui.is_rect_visible(rect) {
                     self.cover(ui, item, rect, 0, Color32::WHITE);
                 }
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &item.name));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &item.name));
                 icons::note(ui, &item.name, rect);
                 if response.clicked() {
                     chosen = Some(item.clone());
@@ -2770,7 +2770,7 @@ impl Gallery {
                     ui.painter().rect_filled(tag, 3, Color32::from_black_alpha(170));
                     ui.painter().galley(tag.min + vec2(3.0, 1.0), label, Color32::WHITE);
                 }
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &item.name));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &item.name));
                 icons::note(ui, &item.name, rect);
                 if response.clicked() {
                     chosen = Some(item.clone());
@@ -2931,7 +2931,7 @@ impl Gallery {
                             Color32::WHITE,
                         );
                         ui.painter().text(rect.center_bottom() - vec2(0.0, 2.0), Align2::CENTER_BOTTOM, name, FontId::proportional(9.0), MUTED);
-                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
                         if response.clicked() {
                             chosen = Some(preset);
                         }

@@ -454,7 +454,7 @@ impl PhotoEditor {
         let edit = egui::TextEdit::multiline(&mut self.prompt)
             // The keyboard can switch the editor between stacked and column layouts.
             // Auto IDs include the parent UI, which would end this editing session.
-            .id(egui::Id::new(("qwen-prompt", &self.session)))
+            .id(egui::Id::unique(("qwen-prompt", &self.session)))
             .hint_text("Paint an area, then describe the change")
             .desired_rows(2)
             .desired_width(f32::INFINITY)

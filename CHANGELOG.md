@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.17 — 2026-10-16
+
+Scrolling has momentum and rubber-bands at the ends, and buttons are a little roomier with
+rounder corners (egui 0.37).
+
 ## v0.1.16 — 2026-10-13
 
 Video editor: Speed plays a segment from 0.25x to 4x with the sound's pitch kept; captions over

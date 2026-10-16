@@ -40,7 +40,7 @@ struct Layout {
 
 /// Adds `controls` in order on the `hand` side of the rest of a horizontal row, sized by the previous pass.
 fn handed(ui: &mut egui::Ui, hand: Hand, salt: &str, controls: impl FnOnce(&mut egui::Ui)) {
-    let id = egui::Id::new(("handed", salt));
+    let id = egui::Id::unique(("handed", salt));
     let width = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
     let free = (ui.available_width() - width - ui.spacing().item_spacing.x).max(0.0);
     ui.add_space(match hand {
@@ -988,7 +988,7 @@ impl Gallery {
                                 let picked =
                                     self.selection.active && self.selection.contains(&item.uri);
                                 let inset = ui.ctx().animate_bool_with_time(
-                                    egui::Id::new(("picked", &item.uri)),
+                                    egui::Id::unique(("picked", &item.uri)),
                                     picked,
                                     0.12,
                                 ) * side
@@ -1347,7 +1347,7 @@ impl Gallery {
                     let active = item.uri == selected.uri;
                     let amount =
                         ui.ctx()
-                            .animate_bool_with_time(ui.id().with(&item.uri), active, 0.14);
+                            .animate_bool_with_time(ui.scope_id().with(&item.uri), active, 0.14);
                     let target = card_slot(index);
                     let rect = Rect::from_center_size(
                         target.center(),
@@ -1373,11 +1373,11 @@ impl Gallery {
                         StrokeKind::Inside,
                     );
                     let response = ui
-                        .interact(target, ui.id().with(("thumb", &item.uri)), Sense::click())
+                        .interact(target, ui.scope_id().with(("thumb", &item.uri)), Sense::click())
                         .on_hover_text(&item.name);
                     response.widget_info(|| {
                         egui::WidgetInfo::selected(
-                            egui::WidgetType::Button,
+                            egui::Role::Button,
                             ui.is_enabled(),
                             active,
                             &item.name,
@@ -1930,7 +1930,7 @@ impl Gallery {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if self.pending_shared.is_some() {
-            egui::Modal::new(egui::Id::new("incoming_media")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("incoming_media")).show(ctx, |ui| {
                 ui.set_max_width(300.0);
                 ui.heading("Open shared media?");
                 ui.label("This closes your current editor. Save a copy first to keep your edits.");
@@ -2201,7 +2201,7 @@ fn action_bar(ui: &mut egui::Ui, actions: &[(&'static str, &str, bool)]) -> Opti
                 color,
             );
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+                egui::WidgetInfo::labeled(egui::Role::Button, enabled, label)
             });
             if response.clicked() {
                 tapped = Some(icon);
@@ -2348,7 +2348,7 @@ impl EguiApp for Gallery {
             host.haptic(egui_mobile::Haptic::Medium);
         }
         if self.busy() {
-            egui::Area::new(egui::Id::new("manage_progress"))
+            egui::Area::new(egui::Id::unique("manage_progress"))
                 .order(egui::Order::Foreground)
                 .anchor(Align2::CENTER_TOP, vec2(0.0, safe.top + 52.0))
                 .show(ui.ctx(), |ui| {
@@ -2384,7 +2384,7 @@ impl EguiApp for Gallery {
             } else {
                 0.0
             };
-            egui::Area::new(egui::Id::new("notice"))
+            egui::Area::new(egui::Id::unique("notice"))
                 .order(egui::Order::Foreground)
                 .interactable(!restore.is_empty())
                 .anchor(
@@ -2624,13 +2624,20 @@ mod tests {
                                         &gallery.album,
                                     )))
                                 };
-                                let mut state =
-                                    egui::scroll_area::State::load(&ctx, id).unwrap_or_default();
-                                state.offset.y = offset as f32;
-                                state.store(&ctx, id);
+                                let mut state = serde_json::to_value(
+                                    egui::scroll_area::State::load(&ctx, id).unwrap_or_default(),
+                                )
+                                .unwrap();
+                                // Sets the stored scroll offset through State's serialized form.
+                                state["offset"]["y"] = (offset as f32).into();
+                                serde_json::from_value::<egui::scroll_area::State>(state)
+                                    .unwrap()
+                                    .store(&ctx, id);
                                 gallery.library(ui);
-                                actual_offset =
-                                    egui::scroll_area::State::load(&ctx, id).unwrap().offset.y;
+                                actual_offset = egui::scroll_area::State::load(&ctx, id)
+                                    .unwrap()
+                                    .unclamped_offset()
+                                    .y;
                             });
                         },
                     );
@@ -2789,7 +2796,7 @@ mod tests {
             ctx.run_ui(Default::default(), |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
                     offset = egui::scroll_area::State::load(ui.ctx(), ui.make_persistent_id(salt))
-                        .map_or(-1.0, |state| state.offset.y);
+                        .map_or(-1.0, |state| state.unclamped_offset().y);
                 });
             })
             .textures_delta
@@ -2955,7 +2962,7 @@ mod tests {
                             };
                             let id = ui.make_persistent_id(salt);
                             gallery.library(ui);
-                            offset = egui::scroll_area::State::load(&ctx, id).unwrap().offset.y;
+                            offset = egui::scroll_area::State::load(&ctx, id).unwrap().unclamped_offset().y;
                         });
                     },
                 );
